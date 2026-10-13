@@ -45,7 +45,7 @@ pub struct Params {
 /// Named parameter sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Preset {
-    /// the emulsion encode pipeline's settings (the Python reference's defaults): detail restored with a 1.3 boost
+    /// the encode pipeline's settings (the Python reference's defaults): detail restored with a 1.3 boost
     #[default]
     Production,
     /// GRAIL's pinned measurement settings: as production, but restored detail is not boosted (detail_boost 1)
@@ -87,7 +87,7 @@ impl Default for Params {
 }
 
 impl Params {
-    /// the emulsion pipeline's denoiser: the Python reference (flowdegrain2.py) with its default arguments
+    /// the encode pipeline's denoiser: the Python reference (flowdegrain2.py) with its default arguments
     pub fn production() -> Params {
         Params {
             radius: 3,

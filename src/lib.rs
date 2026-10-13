@@ -27,7 +27,7 @@
 //! Frames are 10-bit 4:2:0 ([`Frame`]); [`Frame`] converts from and to little-endian bytes (raw `yuv420p10le`, y4m
 //! payloads), strided planes, 8-bit planes and, with the `v_frame` feature, `v_frame::frame::Frame<u16>`.
 //!
-//! The two presets ([`Preset`]): `production` (the emulsion encode pipeline's denoiser) and `measure` (GRAIL's
+//! The two presets ([`Preset`]): `production` (the encode pipeline's denoiser) and `measure` (GRAIL's
 //! pinned measurement settings: the same without the detail boost).
 use anyhow::{bail, ensure, Result};
 

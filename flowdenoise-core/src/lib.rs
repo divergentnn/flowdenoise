@@ -95,6 +95,7 @@ pub fn open(width: usize, height: usize, params: &Params, backend: Backend, devi
                 _ => None,
             };
             let g = cuda::init(kind, device as i32)?;
+            g.bind_thread()?; // the context is current on the thread that opened it; make it current here too
             if let Some(k) = kind {
                 if g.kind != k {
                     bail!("the GPU is already open with the {:?} backend", g.kind);
