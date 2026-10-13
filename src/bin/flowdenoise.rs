@@ -135,12 +135,13 @@ fn run() -> Result<()> {
 
     // reader -> GPU -> writer, two frames of slack on each side
     let (in_tx, in_rx): (SyncSender<FrameMsg>, Receiver<FrameMsg>) = sync_channel(2);
-    let (out_tx, out_rx) = sync_channel::<Vec<u8>>(2);
-    let (free_tx, free_rx) = sync_channel::<Vec<u8>>(4);
+    let (out_tx, out_rx) = sync_channel::<Frame>(2);
+    let (free_tx, free_rx) = sync_channel::<Frame>(4);
     let reader = std::thread::spawn(move || {
         loop {
             let msg = match dec.read_frame() {
                 Ok(f) => {
+                    // the payload is contiguous Y U V, but the decoder hands out three slices
                     let mut bytes = Vec::with_capacity(w * h * 3);
                     for p in [f.get_y_plane(), f.get_u_plane(), f.get_v_plane()] {
                         bytes.extend_from_slice(p);
@@ -159,22 +160,28 @@ fn run() -> Result<()> {
     let writer = std::thread::spawn(move || -> Result<()> {
         let mut wr = BufWriter::with_capacity(1 << 22, wr);
         wr.write_all(&header)?;
-        for buf in out_rx {
+        let mut bytes = Vec::new();
+        for frame in out_rx {
             wr.write_all(b"FRAME\n")?;
-            wr.write_all(&buf)?;
-            let _ = free_tx.try_send(buf);
+            if cfg!(target_endian = "little") {
+                wr.write_all(frame.as_le_bytes())?;
+            } else {
+                bytes.clear();
+                frame.write_le_bytes(&mut bytes);
+                wr.write_all(&bytes)?;
+            }
+            let _ = free_tx.try_send(frame);
         }
         wr.flush()?;
         Ok(())
     });
 
     let mut progress = Progress::new(!cli.quiet);
-    let mut out = Frame::new(w, h)?;
     let mut eof = false;
     let result = (|| -> Result<()> {
         loop {
             // produce whatever is ready; otherwise feed the lookahead (the reference's order of work)
-            if den_ready(&mut den, &mut out, &out_tx, &free_rx, &mut progress)? {
+            if den_ready(&mut den, &out_tx, &free_rx, &mut progress)? {
                 continue;
             }
             if eof {
@@ -200,15 +207,18 @@ fn run() -> Result<()> {
 }
 
 /// produce one frame if the denoiser has one ready and hand it to the writer; false if none was ready
-fn den_ready(den: &mut Denoiser, out: &mut Frame, out_tx: &SyncSender<Vec<u8>>, free_rx: &Receiver<Vec<u8>>,
-             progress: &mut Progress) -> Result<bool> {
-    if !den.receive_frame_into(out)? {
+fn den_ready(den: &mut Denoiser, out_tx: &SyncSender<Frame>, free_rx: &Receiver<Frame>, progress: &mut Progress)
+             -> Result<bool> {
+    if den.ready().is_none() {
         return Ok(false);
     }
-    let mut buf = free_rx.try_recv().unwrap_or_default();
-    buf.clear();
-    out.write_le_bytes(&mut buf);
-    out_tx.send(buf).map_err(|_| anyhow::anyhow!("writer thread stopped"))?;
+    // a frame buffer the writer has finished with, or a new one
+    let mut out = match free_rx.try_recv() {
+        Ok(f) => f,
+        Err(_) => Frame::new(den.width(), den.height())?,
+    };
+    den.receive_frame_into(&mut out)?;
+    out_tx.send(out).map_err(|_| anyhow::anyhow!("writer thread stopped"))?;
     progress.tick(den.frames_out());
     Ok(true)
 }

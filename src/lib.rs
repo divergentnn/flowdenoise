@@ -59,7 +59,15 @@ impl Frame {
     pub fn from_le_bytes(width: usize, height: usize, bytes: &[u8]) -> Result<Frame> {
         check_dims(width, height)?;
         ensure!(bytes.len() == width * height * 3, "yuv420p10le data: {} bytes for {width}x{height}", bytes.len());
-        let data = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let mut data = vec![0u16; bytes.len() / 2];
+        if cfg!(target_endian = "little") {
+            // the same bytes: one copy
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_mut_ptr() as *mut u8, bytes.len()) };
+        } else {
+            for (d, b) in data.iter_mut().zip(bytes.chunks_exact(2)) {
+                *d = u16::from_le_bytes([b[0], b[1]]);
+            }
+        }
         Ok(Frame { width, height, data })
     }
 
@@ -147,10 +155,20 @@ impl Frame {
 
     /// little-endian 16-bit samples (raw yuv420p10le, a y4m C420p10 frame payload), appended to `out`
     pub fn write_le_bytes(&self, out: &mut Vec<u8>) {
-        out.reserve(self.data.len() * 2);
-        for &v in &self.data {
-            out.extend_from_slice(&v.to_le_bytes());
+        if cfg!(target_endian = "little") {
+            out.extend_from_slice(self.as_le_bytes());
+        } else {
+            out.reserve(self.data.len() * 2);
+            for &v in &self.data {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
         }
+    }
+
+    /// the samples as little-endian bytes without a copy (little-endian targets only; elsewhere use write_le_bytes)
+    #[cfg(target_endian = "little")]
+    pub fn as_le_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len() * 2) }
     }
 
     pub fn to_le_bytes(&self) -> Vec<u8> {
@@ -269,6 +287,11 @@ impl Denoiser {
     /// end of the input: the frames still held for lookahead become available
     pub fn flush(&mut self) {
         self.inner.finish();
+    }
+
+    /// index of the next frame that can be produced now (receive_frame will return it)
+    pub fn ready(&self) -> Option<usize> {
+        self.inner.ready()
     }
 
     /// the next denoised frame, if it can be produced now
