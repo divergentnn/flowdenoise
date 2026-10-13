@@ -136,6 +136,12 @@ with its default arguments, `measure` equals it with `--detail-boost 1` and equa
 `flowdenoise-core/kernels/README.md` explains the numerical rules that keep it that way and the tools that check a
 kernel edit (identical SASS and PTX per kernel; output hashes before and after).
 
+## Speed
+
+On an RTX 3090 shared with other jobs, the CLI runs about as fast as the Python reference: about 100 frames/s at
+1080p and 30 frames/s at 4K (y4m from disk, output discarded; the reference: 105 and 29). The GPU waits while a frame
+is copied in and out; overlapping those copies with the next frame's work is on the roadmap.
+
 ## Algorithms and acknowledgements
 
 flowdenoise contains no third-party code. It implements published methods:
