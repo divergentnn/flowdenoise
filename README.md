@@ -9,8 +9,7 @@ a guided filter, and it puts back the current frame's own fine detail wherever t
 detail is texture rather than noise.
 
 It is the denoiser of an AV1 encode pipeline (grain removal before film-grain synthesis) and the measurement denoiser
-of [GRAILS](https://github.com/divergentnn/grail), a grain-aware video quality metric. On CUDA its output is
-bit-identical to the Python reference it was ported from.
+of [GRAILS](https://github.com/divergentnn/grail), a grain-aware video quality metric.
 
 ## Features
 
