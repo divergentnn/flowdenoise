@@ -135,6 +135,13 @@ with its default arguments, `measure` equals it with `--detail-boost 1` and equa
 `flowdenoise-core/kernels/README.md` explains the numerical rules that keep it that way and the tools that check a
 kernel edit (identical SASS and PTX per kernel; output hashes before and after).
 
+The readability pass of the kernels (renames, comments, layout) is proven a no-op on CUDA only: identical SASS on
+sm_75 ... sm_120, identical PTX and identical outputs. For Metal, the equivalence is established by
+`tools/check_metal.sh` on a Mac, which compares the output hashes before and after the pass; that run is still
+pending. The LLVM IR comparison of the MSL compiled as C++ (`tools/compare_msl_ir.py`) is only a pre-flight check,
+because it does not model the Metal compiler. HIP has no such check yet: its kernels compile with hipcc but have not
+been run. No SASS comparison covers Metal or HIP.
+
 ## Speed
 
 On an RTX 3090 shared with other jobs, the CLI runs about as fast as the Python reference: about 100 frames/s at

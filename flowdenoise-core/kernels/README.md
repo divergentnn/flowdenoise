@@ -100,6 +100,9 @@ Comments, names and layout can change freely. Anything else needs the checks bel
 | `tools/check_cuda.sh [clips]` | output hashes of both presets, before and after the readability commit | CUDA GPU |
 | `tools/check_metal.sh [clips]` | the same on Metal | Mac |
 
+SASS and PTX prove the readability pass for CUDA only. For Metal, `tools/check_metal.sh` on a Mac is the check; it is
+still pending, and `compare_msl_ir.py` is only its pre-flight. HIP is compile-checked only.
+
 `.clang-format` at the repository root is the style: `clang-format -i flowdenoise-core/kernels/*.cu
 flowdenoise-core/kernels/*.h flowdenoise-core/kernels/metal/*.metal`.
 

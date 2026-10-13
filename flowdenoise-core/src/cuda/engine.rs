@@ -372,10 +372,8 @@ impl Denoiser {
                     nb.push((dlt as i32, f));
                 }
             }
-            let cur_ref = &self.frames[cur].1;
-            // the engine is borrowed mutably while the frames are borrowed: split the borrow
-            let eng: *mut Engine = &mut self.eng;
-            unsafe { (*eng).process(cur_ref, &nb, out)? };
+            // disjoint fields: the frames are borrowed while the engine is borrowed mutably
+            self.eng.process(&self.frames[cur].1, &nb, out)?;
         }
         while let Some((k, _)) = self.frames.front() {
             if (*k as i64) < t as i64 - self.radius as i64 + 1 {
