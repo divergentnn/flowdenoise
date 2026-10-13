@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = ["flowdenoise-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-3.0-only"
+repository = ""
+
+[package]
+name = "flowdenoise"
+description = "Motion-compensated temporal video denoiser on the GPU: DIS-style motion search, Lanczos-3 warps, MVTools-style temporal weighting (CUDA, Metal)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["denoise", "video", "gpu", "cuda", "metal"]
+categories = ["multimedia::video"]
+exclude = ["/work", "/tools", "progress.log"]
+
+[features]
+# CUDA on Linux / Windows, Metal on macOS: each backend is inert on the other platforms, so the defaults build everywhere
+default = ["cuda", "metal"]
+cuda = ["flowdenoise-core/cuda"]
+# HIP (ROCm) is compile-checked only: the same kernels through hipcc and the HIP module API
+hip = ["flowdenoise-core/hip"]
+metal = ["flowdenoise-core/metal"]
+# conversions to and from v_frame::frame::Frame<u16>
+v_frame = ["dep:v_frame"]
+# the `flowdenoise` command-line tool (y4m in, y4m out)
+binary = ["dep:clap", "dep:y4m"]
+
+[lib]
+name = "flowdenoise"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flowdenoise"
+path = "src/bin/flowdenoise.rs"
+required-features = ["binary"]
+
+[dependencies]
+flowdenoise-core = { path = "flowdenoise-core", version = "0.1.0", default-features = false }
+anyhow = "1.0.100"
+clap = { version = "4.6.0", features = ["derive", "env"], optional = true }
+y4m = { version = "0.8.0", optional = true }
+v_frame = { version = "0.5.1", optional = true }
+
+[profile.release]
+opt-level = 3
+debug = 1

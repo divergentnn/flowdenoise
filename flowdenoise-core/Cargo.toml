@@ -1,0 +1,33 @@
+[package]
+name = "flowdenoise-core"
+description = "Kernels and GPU backends of flowdenoise: motion search, Lanczos-3 warps, MVTools-style temporal weighting, fusion and gates (CUDA, Metal; HIP compile-checked)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["denoise", "video", "gpu", "cuda", "metal"]
+categories = ["multimedia::video"]
+build = "build.rs"
+include = ["/src", "/kernels", "/build.rs", "/Cargo.toml"]
+
+[features]
+default = []
+# the CUDA kernels (nvcc at build time) and the CUDA driver API (libcuda, loaded at run time); inert on macOS
+cuda = ["dep:libloading"]
+# the same kernels through hipcc and the HIP module API (libamdhip64); compile-checked only
+hip = ["dep:libloading"]
+# the MSL kernels, compiled from source when the device is opened; macOS only (inert elsewhere)
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+
+[dependencies]
+anyhow = "1.0.100"
+libloading = { version = "0.8.9", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.3", optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError"], optional = true }
+objc2-metal = { version = "0.3.2", default-features = false, optional = true, features = [
+    "std", "objc2-core-foundation", "MTLDevice", "MTLBuffer", "MTLResource", "MTLLibrary", "MTLCommandQueue", "MTLCommandBuffer",
+    "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLTypes", "MTLAllocation",
+] }
