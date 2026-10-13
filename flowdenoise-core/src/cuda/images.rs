@@ -3,14 +3,18 @@ use super::driver::Kind;
 
 /// kernels/flowdenoise.cu (fast math)
 pub const DENOISE_KERNELS: &[&str] = &[
-    "sep3_0", "sep3_1", "sep5_0", "sep5_1", "sep7_0", "sep7_1", "sep8_0", "sep8_1", "sep19_0", "sep19_1",
-    "sep37_0", "sep37_1", "sep", "down", "raster", "dense", "warp_y", "weight_only", "reduce_frames", "chroma",
+    "separable_filter_3_x", "separable_filter_3_y", "separable_filter_5_x", "separable_filter_5_y",
+    "separable_filter_7_x", "separable_filter_7_y", "separable_filter_8_x", "separable_filter_8_y",
+    "separable_filter_19_x", "separable_filter_19_y", "separable_filter_37_x", "separable_filter_37_y",
+    "separable_filter_any", "downsample_2x2", "motion_search_sweep", "densify_flow", "warp_luma", "temporal_weight",
+    "fuse_frames", "warp_accumulate_chroma",
 ];
 /// kernels/flowdenoise_ops.cu (no fast math)
 pub const OPS_KERNELS: &[&str] = &[
-    "u16_to_f32", "ew_absdiff", "ew_energy", "ew_sub", "ew_sqr", "ew_abs", "ew_div_bc", "ew_q8", "ew_rint", "ew_guide",
-    "ew_alpha", "ew_blend", "ew_finish", "ew_pack", "gather_stride", "sel_init", "sel_hist", "sel_scan", "sel_value",
-    "noise_var", "quantile_finish",
+    "u16_to_float", "abs_diff", "squared_diff", "subtract", "square", "absolute", "divide_broadcast", "quantize_8bit",
+    "round_to_integer", "guided_coefficients", "fallback_alpha", "guided_blend", "detail_gate_luma", "pack_10bit",
+    "gather_strided", "radix_select_init", "radix_select_histogram", "radix_select_scan", "radix_select_value",
+    "noise_variance", "quantile_lerp",
 ];
 
 #[cfg(feature = "cuda")]

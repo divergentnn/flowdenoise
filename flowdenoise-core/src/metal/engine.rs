@@ -92,19 +92,19 @@ impl Engine {
         let (z, pr) = (zero as i32, pre as i32);
         match len {
             3 | 5 | 7 | 8 | 19 | 37 => {
-                launch(&format!("sep{len}_0"), grid, (32, 8, 1), 0, args![src, tmp, w as i32, h as i32, kp, z, pr])?;
-                launch(&format!("sep{len}_1"), grid, (32, 8, 1), 0, args![tmp, dst, w as i32, h as i32, kp, z, pr])
+                launch(&format!("separable_filter_{len}_x"), grid, (32, 8, 1), 0, args![src, tmp, w as i32, h as i32, kp, z, pr])?;
+                launch(&format!("separable_filter_{len}_y"), grid, (32, 8, 1), 0, args![tmp, dst, w as i32, h as i32, kp, z, pr])
             }
             _ => {
                 let n = (w * h * planes) as i32;
-                launch_n("sep", n as usize, args![src, tmp, w as i32, h as i32, n, kp, len as i32, 0i32, z])?;
-                launch_n("sep", n as usize, args![tmp, dst, w as i32, h as i32, n, kp, len as i32, 1i32, z])
+                launch_n("separable_filter_any", n as usize, args![src, tmp, w as i32, h as i32, n, kp, len as i32, 0i32, z])?;
+                launch_n("separable_filter_any", n as usize, args![tmp, dst, w as i32, h as i32, n, kp, len as i32, 1i32, z])
             }
         }
     }
 
     fn down(&self, src: u64, dst: u64, w: usize, h: usize) -> Result<()> {
-        launch_n("down", (w / 2) * (h / 2), args![src, dst, w as i32, h as i32])
+        launch_n("downsample_2x2", (w / 2) * (h / 2), args![src, dst, w as i32, h as i32])
     }
 
     /// Engine.ingest of one 10-bit 4:2:0 frame (w x h, planes Y U V)
@@ -116,7 +116,7 @@ impl Engine {
         let up = self.buf("raw", raw.len() * 2)?;
         super::driver::gpu().htod(up, raw.as_ptr() as *const _, raw.len() * 2)?;
         let yc = DBuf::f32(n + 2 * nc)?;
-        launch_n("u16_to_f32", n + 2 * nc, args![up, &yc, (n + 2 * nc) as i64])?;
+        launch_n("u16_to_float", n + 2 * nc, args![up, &yc, (n + 2 * nc) as i64])?;
         let g0 = self.buf("ingest_g", n * 4)?;
         self.filt(yc.ptr, g0, w, h, 1, "ingest", false, false)?;
         let (mut lw, mut lh) = (w, h);
@@ -129,14 +129,14 @@ impl Engine {
             lh = h / 2;
         }
         let l0 = DBuf::f32(lw * lh)?;
-        launch_n("ew_q8", lw * lh, args![g, &l0, (lw * lh) as i64])?;
+        launch_n("quantize_8bit", lw * lh, args![g, &l0, (lw * lh) as i64])?;
         let mut levels = vec![(l0, lw, lh)];
         for level in 1..self.p.levels {
             let (pw, ph) = (levels[level - 1].1, levels[level - 1].2);
             let nxt = DBuf::f32((pw / 2) * (ph / 2))?;
             self.down(levels[level - 1].0.ptr, nxt.ptr, pw, ph)?;
             if self.p.round_motion && level >= self.p.finest {
-                launch_n("ew_rint", (pw / 2) * (ph / 2), args![&nxt, &nxt, ((pw / 2) * (ph / 2)) as i64])?;
+                launch_n("round_to_integer", (pw / 2) * (ph / 2), args![&nxt, &nxt, ((pw / 2) * (ph / 2)) as i64])?;
             }
             levels.push((nxt, pw / 2, ph / 2));
         }
@@ -165,17 +165,17 @@ impl Engine {
             let grid = (bh as u32, d as u32, 1);
             let n6 = [ns[0], ns[1], ns[2], ns[3], ns[4], ns[5]];
             // one SIMD group (32 lanes, two pixels each) per patch row
-            launch("raster", grid, (32, 1, 1), 0,
+            launch("motion_search_sweep", grid, (32, 1, 1), 0,
                    args![c, n6[0], n6[1], n6[2], n6[3], n6[4], n6[5], w as i32, h as i32, pp, pw as i32, ph as i32, 0u64, fwd,
                          bw as i32, bh as i32, 0i32, it])?;
-            launch("raster", grid, (32, 1, 1), 0,
+            launch("motion_search_sweep", grid, (32, 1, 1), 0,
                    args![c, n6[0], n6[1], n6[2], n6[3], n6[4], n6[5], w as i32, h as i32, pp, pw as i32, ph as i32, fwd, back,
                          bw as i32, bh as i32, 1i32, it])?;
             // ping-pong between two dense buffers: the next level reads `pred` while writing the other
             let name = if flip { "r_pred_a" } else { "r_pred_b" };
             flip = !flip;
             let np = self.buf(name, d * 2 * w * h * 4)?;
-            launch("dense", ((w * h).div_ceil(256) as u32, d as u32, 1), (256, 1, 1), 0,
+            launch("densify_flow", ((w * h).div_ceil(256) as u32, d as u32, 1), (256, 1, 1), 0,
                    args![c, n6[0], n6[1], n6[2], n6[3], n6[4], n6[5], back, np, w as i32, h as i32, bw as i32, bh as i32])?;
             pred = Some((np, w, h));
         }
@@ -186,11 +186,11 @@ impl Engine {
     fn noise(&mut self, hp: u64, plane: usize, planes: usize, var: u64, mult: f32) -> Result<()> {
         let m = plane.div_ceil(53);
         let g = self.buf("noise_g", m * planes * 4)?;
-        launch_n("gather_stride", m * planes, args![hp, g, plane as i64, 53i64, m as i64, planes as i32, 1i32])?;
+        launch_n("gather_strided", m * planes, args![hp, g, plane as i64, 53i64, m as i64, planes as i32, 1i32])?;
         let med = self.buf("noise_med", 4)?;
         for p in 0..planes {
             self.sel.kth(g + (p * m * 4) as u64, m, ((m - 1) / 2) as u32, med)?;
-            launch("noise_var", (1, 1, 1), (32, 1, 1), 0, args![med, var + (p * 4) as u64, mult])?;
+            launch("noise_variance", (1, 1, 1), (32, 1, 1), 0, args![med, var + (p * 4) as u64, mult])?;
         }
         Ok(())
     }
@@ -207,12 +207,12 @@ impl Engine {
         let gb = self.buf(pfx[4], n * 4)?;
         let tmp = self.buf(pfx[5], n * 4)?;
         self.filt(x, m, w, h, planes, taps, false, false)?;
-        launch_n("ew_sqr", n, args![x, x2, n as i64])?;
+        launch_n("square", n, args![x, x2, n as i64])?;
         self.filt(x2, m2, w, h, planes, taps, false, false)?;
-        launch_n("ew_guide", n, args![m, m2, eps, ga, gb, n as i64, (w * h) as i64])?;
+        launch_n("guided_coefficients", n, args![m, m2, eps, ga, gb, n as i64, (w * h) as i64])?;
         self.filt(ga, m, w, h, planes, taps, false, false)?;     // box(ga)
         self.filt(gb, tmp, w, h, planes, taps, false, false)?;   // box(gb)
-        launch_n("ew_blend", n, args![x, alpha, m, tmp, out, n as i64, am as i64])
+        launch_n("guided_blend", n, args![x, alpha, m, tmp, out, n as i64, am as i64])
     }
 
     /// Engine.process: the denoised frame (int16 luma + chroma) into `out`
@@ -233,7 +233,7 @@ impl Engine {
         let g1 = self.buf("g1", n * 4)?;
         self.filt(y, g1, w, h, 1, "g1", false, false)?;
         let hc = self.buf("hc", n * 4)?;
-        launch_n("ew_sub", n, args![y, g1, hc, n as i64])?;
+        launch_n("subtract", n, args![y, g1, hc, n as i64])?;
         let acc = self.buf("acc", n * 4)?;
         let ws = self.buf("ws", n * 4)?;
         let sq = self.buf("sq", n * 4)?;
@@ -261,27 +261,27 @@ impl Engine {
             for (j, (dist, other)) in nbrs.iter().enumerate() {
                 let f = fs + (j * 2 * fw * fh * 4) as u64;
                 let yw = warped + (j * n * 4) as u64;
-                launch_n("warp_y", n, args![other.y(), y, f, yw, dd, speed, w as i32, h as i32, fw as i32, fh as i32, scale])?;
+                launch_n("warp_luma", n, args![other.y(), y, f, yw, dd, speed, w as i32, h as i32, fw as i32, fh as i32, scale])?;
                 self.filt(yw, t1, w, h, 1, "pre", false, true)?;
-                launch_n("ew_absdiff", n, args![t1, cur.pc.ptr, t2, n as i64])?;
+                launch_n("abs_diff", n, args![t1, cur.pc.ptr, t2, n as i64])?;
                 self.filt(t2, sad, w, h, 1, "sad", true, false)?;
                 self.filt(dd, spread, w, h, 1, "g6", false, false)?;
                 self.filt(yw, low, w, h, 1, "g1", false, false)?;
                 let wt = weights + (j * n * 4) as u64;
                 let hp = high + (j * n * 4) as u64;
-                launch_n("weight_only", n, args![yw, low, sad, dd, spread, speed, wt, hp, w as i32, h as i32,
+                launch_n("temporal_weight", n, args![yw, low, sad, dd, spread, speed, wt, hp, w as i32, h as i32,
                                                  p.thsad, dist.abs() as f32, p.fast_th, p.spike])?;
-                launch_n("chroma", nc, args![other.c(), f, wt, ac, wc, w2 as i32, h2 as i32, fw as i32, fh as i32, scale])?;
+                launch_n("warp_accumulate_chroma", nc, args![other.c(), f, wt, ac, wc, w2 as i32, h2 as i32, fw as i32, fh as i32, scale])?;
             }
         }
-        launch_n("reduce_frames", n, args![y, hc, warped, weights, high, acc, ws, sq, hs, ha, n as i32, d as i32])?;
+        launch_n("fuse_frames", n, args![y, hc, warped, weights, high, acc, ws, sq, hs, ha, n as i32, d as i32])?;
         let oy = self.buf("oy", n * 4)?;
-        launch_n("ew_div_bc", n, args![acc, ws, oy, n as i64, n as i64])?;
+        launch_n("divide_broadcast", n, args![acc, ws, oy, n as i64, n as i64])?;
         let oc = self.buf("oc", 2 * nc * 4)?;
-        launch_n("ew_div_bc", 2 * nc, args![ac, wc, oc, (2 * nc) as i64, nc as i64])?;
+        launch_n("divide_broadcast", 2 * nc, args![ac, wc, oc, (2 * nc) as i64, nc as i64])?;
         let (oy2, oc2) = if p.fallback > 1.0 {
             let alpha = self.buf("alpha", n * 4)?;
-            launch_n("ew_alpha", n, args![ws, sq, p.fallback, alpha, n as i64])?;
+            launch_n("fallback_alpha", n, args![ws, sq, p.fallback, alpha, n as i64])?;
             let var_y = self.buf("var_y", 4)?;
             self.noise(hc, n, 1, var_y, p.fallback_eps)?;
             let oy2 = self.buf("oy2", n * 4)?;
@@ -290,7 +290,7 @@ impl Engine {
             let gc = self.buf("gc", 2 * nc * 4)?;
             self.filt(cur.c(), gc, w2, h2, 2, "g1", false, false)?;
             let hpc = self.buf("hpc", 2 * nc * 4)?;
-            launch_n("ew_sub", 2 * nc, args![cur.c(), gc, hpc, (2 * nc) as i64])?;
+            launch_n("subtract", 2 * nc, args![cur.c(), gc, hpc, (2 * nc) as i64])?;
             let var_c = self.buf("var_c", 8)?;
             self.noise(hpc, nc, 2, var_c, p.fallback_eps)?;
             let alpha_c = self.buf("alpha_c", nc * 4)?;
@@ -305,24 +305,24 @@ impl Engine {
         let low = self.buf("f_low", n * 4)?;
         self.filt(oy2, low, w, h, 1, "g1", false, false)?;
         let en = self.buf("f_en", n * 4)?;
-        launch_n("ew_energy", n, args![oy2, low, en, n as i64])?;
+        launch_n("squared_diff", n, args![oy2, low, en, n as i64])?;
         let e = self.buf("f_e", n * 4)?;
         self.filt(en, e, w, h, 1, "g3", false, false)?;
         let m97 = n.div_ceil(97);
         let es = self.buf("f_es", m97 * 4)?;
-        launch_n("gather_stride", m97, args![e, es, n as i64, 97i64, m97 as i64, 1i32, 0i32])?;
+        launch_n("gather_strided", m97, args![e, es, n as i64, 97i64, m97 as i64, 1i32, 0i32])?;
         let ef = self.buf("f_ef", 4)?;
         let qtmp = self.pool.remove("f_qtmp").map(Ok).unwrap_or_else(|| DBuf::new(8))?;
         self.sel.quantile(es, m97, 0.25, ef, &qtmp)?;
         self.pool.insert("f_qtmp", qtmp);
         let ahs = self.buf("f_ahs", n * 4)?;
-        launch_n("ew_abs", n, args![hs, ahs, n as i64])?;
+        launch_n("absolute", n, args![hs, ahs, n as i64])?;
         let ghs = self.buf("f_ghs", n * 4)?;
         self.filt(ahs, ghs, w, h, 1, "g1", false, false)?;
         let gha = self.buf("f_gha", n * 4)?;
         self.filt(ha, gha, w, h, 1, "g1", false, false)?;
-        launch_n("ew_finish", n, args![oy2, low, hc, ghs, gha, sq, ws, e, ef, p.detail_gate, p.detail_boost, out.ptr, n as i64])?;
-        launch_n("ew_pack", 2 * nc, args![oc2, out.ptr + (n * 2) as u64, (2 * nc) as i64])
+        launch_n("detail_gate_luma", n, args![oy2, low, hc, ghs, gha, sq, ws, e, ef, p.detail_gate, p.detail_boost, out.ptr, n as i64])?;
+        launch_n("pack_10bit", 2 * nc, args![oc2, out.ptr + (n * 2) as u64, (2 * nc) as i64])
     }
 }
 

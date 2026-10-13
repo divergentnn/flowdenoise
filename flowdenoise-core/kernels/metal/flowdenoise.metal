@@ -1,201 +1,673 @@
-// flowdenoise kernels in Metal Shading Language: flowdenoise.cu with the CUDA spellings mapped to MSL. Each kernel
-// takes its CUDA argument list as one constant struct (same order, C layout; device pointers inside it); the body
-// then reads the same names. The warp reductions use SIMD-group shuffles (32 lanes on Apple GPUs, as a CUDA warp) in
-// the same order. Compiled with fast math, as the reference's (--use_fast_math). Not bit-exact with CUDA: another
-// compiler and other fast-math functions. Moved verbatim from GRAIL (kernels/metal/flowdegrain2.metal).
+// flowdenoise.metal: the image kernels of the denoiser in Metal Shading Language, a port of flowdenoise.cu (read the
+// kernel descriptions there; this file notes what differs on Metal).
+//
+// Each kernel takes its CUDA argument list as one constant struct (same order, C layout, device pointers inside it,
+// packed by the host); the body reads the same names as the CUDA kernel. The CUDA thread / block indices keep their
+// CUDA names (KERNEL_INDICES). Compiled with fast math, as the CUDA kernels; not bit-exact with CUDA (another compiler,
+// other fast-math functions, another summation order in the motion search), but the same operations in the same
+// order otherwise (README.md, "Numerical rules").
 #include <metal_stdlib>
 using namespace metal;
 
-#define KARGS uint3 blockIdx [[threadgroup_position_in_grid]], uint3 threadIdx [[thread_position_in_threadgroup]], \
-              uint3 blockDim [[threads_per_threadgroup]]
-#define SYNC() threadgroup_barrier(mem_flags::mem_threadgroup)
-typedef device const float* cfp;
-typedef device float* fp;
+#define KERNEL_INDICES                                                                                   \
+    uint3 blockIdx [[threadgroup_position_in_grid]], uint3 threadIdx [[thread_position_in_threadgroup]], \
+        uint3 blockDim [[threads_per_threadgroup]]
+#define SYNC_THREADGROUP() threadgroup_barrier(mem_flags::mem_threadgroup)
+typedef device const float* in_plane;
+typedef device float* out_plane;
 
-static inline int imax(int a, int b) { return a > b ? a : b; }
-static inline int imin(int a, int b) { return a < b ? a : b; }
-static inline float hypot2(float a, float b) { return sqrt(a * a + b * b); }
+static inline int max_int(int a, int b) {
+    return a > b ? a : b;
+}
+static inline int min_int(int a, int b) {
+    return a < b ? a : b;
+}
+// |(a, b)| (CUDA hypotf)
+static inline float hypot2(float a, float b) {
+    return sqrt(a * a + b * b);
+}
 
-// Specialised separable shared-memory tiles; 32 contiguous lanes, 8 output rows.
-struct SepArgs { cfp a; fp b; int W, H; cfp k; int zero, pre; };
-template<int L,int AX> kernel void filter_tile(constant SepArgs& P [[buffer(0)]], KARGS) {
- constexpr int SW=32+(AX==0?L-1:0),SH=8+(AX==1?L-1:0);
- threadgroup float s[SW*SH];
- cfp a=P.a; fp b=P.b; const int W=P.W,H=P.H; cfp k=P.k; const int zero=P.zero,pre=P.pre;
- int t=threadIdx.y*32+threadIdx.x,bx=blockIdx.x*32,by=blockIdx.y*8;
- a+=blockIdx.z*W*H;b+=blockIdx.z*W*H;
- for(int j=t;j<SW*SH;j+=256){int x=bx+j%SW-(AX==0?L/2:0),y=by+j/SW-(AX==1?L/2:0);
- s[j]=(zero&&(x<0||x>=W||y<0||y>=H))?0:a[imax(0,imin(y,H-1))*W+imax(0,imin(x,W-1))];}
- SYNC();int x=bx+threadIdx.x,y=by+threadIdx.y;
- if(x>=W||y>=H)return;float v=0;
- if(L%2){
- int center=(threadIdx.y+(AX==1?L/2:0))*SW+threadIdx.x+(AX==0?L/2:0);
- v=k[L/2]*s[center];
- #pragma unroll
- for(int j=1;j<=L/2;j++)v+=k[L/2+j]*(s[center+j*(AX==0?1:SW)]+s[center-j*(AX==0?1:SW)]);
- }else{
- #pragma unroll
- for(int j=0;j<L;j++)v+=k[j]*s[(threadIdx.y+(AX==1?j:0))*SW+threadIdx.x+(AX==0?j:0)];
- }
- // Two successive replicate-padded 121 passes differ from a replicate-padded
- // binomial-5 only at the very first/last sample.
- if(L==5&&pre){int p=AX==0?x:y,extent=AX==0?W:H;
- int center=(threadIdx.y+(AX==1?2:0))*SW+threadIdx.x+(AX==0?2:0);
- if(p==0)v+=(s[center+(AX==0?1:SW)]-s[center])*.0625f;
- if(p==extent-1)v+=(s[center-(AX==0?1:SW)]-s[center])*.0625f;}
- b[y*W+x]=v;
-}
-#define FILTER(L,A) template [[host_name("sep" #L "_" #A)]] kernel void filter_tile<L,A>(constant SepArgs&, uint3, uint3, uint3);
-FILTER(3,0) FILTER(3,1) FILTER(5,0) FILTER(5,1) FILTER(7,0) FILTER(7,1)
-FILTER(8,0) FILTER(8,1) FILTER(19,0) FILTER(19,1) FILTER(37,0) FILTER(37,1)
+// ------------------------------------------------------------------------------------------------ sampling helpers
 
-static inline int cl(int a,int n) { return imax(0,imin(a,n-1)); }
-static inline float sat(float a) { return fmin(1.f,fmax(0.f,a)); }
-static inline float at(cfp a,int x,int y,int W,int H) { return a[cl(y,H)*W+cl(x,W)]; }
-static inline float bil(cfp a,float x,float y,int W,int H) {
- int ix=(int)floor(x),iy=(int)floor(y); float dx=x-ix,dy=y-iy;
- return (1-dy)*((1-dx)*at(a,ix,iy,W,H)+dx*at(a,ix+1,iy,W,H))+
- dy*((1-dx)*at(a,ix,iy+1,W,H)+dx*at(a,ix+1,iy+1,W,H));
+static inline int clamp_index(int index, int size) {
+    return max_int(0, min_int(index, size - 1));
 }
-struct SepGArgs { cfp a; fp b; int W, H, N; cfp k; int L, axis, zero; };
-kernel void sep(constant SepGArgs& P [[buffer(0)]], KARGS) {
- cfp a=P.a; fp b=P.b; const int W=P.W,H=P.H,N=P.N,L=P.L,axis=P.axis,zero=P.zero; cfp k=P.k;
- int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=N)return;
- int x=i%W,y=(i/W)%H,base=i-y*W-x; float v=0;
- for(int j=0;j<L;j++) {int xx=x+(axis==0?j-L/2:0),yy=y+(axis==1?j-L/2:0);
- if(!zero || (xx>=0&&xx<W&&yy>=0&&yy<H))v+=k[j]*a[base+cl(yy,H)*W+cl(xx,W)];}
- b[i]=v;
+static inline float saturate_unit(float value) {
+    return fmin(1.f, fmax(0.f, value));
 }
-struct DownArgs { cfp a; fp b; int W, H; };
-kernel void down(constant DownArgs& P [[buffer(0)]], KARGS) {
- cfp a=P.a; fp b=P.b; const int W=P.W,H=P.H;
- int w=W/2,h=H/2,i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=w*h)return;
- int p=(i/w*2)*W+(i%w*2);b[i]=(a[p]+a[p+1]+a[p+W]+a[p+W+1])*.25f;
+static inline float sample_clamped(in_plane plane, int x, int y, int width, int height) {
+    return plane[clamp_index(y, height) * width + clamp_index(x, width)];
 }
-// GPU row-sweep inverse search: spatial propagation without inter-block races.
-// Opposite sweep uses the prior completed pass for vertical candidates.
-// Metal: one SIMD group per 8x8 patch, each lane holding two pixels (rows r and r + 4), so every patch sum is one
-// hardware SIMD reduction without threadgroup barriers (CUDA: 64 threads, shuffle tree per warp, then the two warps;
-// another summation order). The neighbours' levels come as pointers (ns[d]) instead of one copied stack.
-static inline float R(float a,float b) { return simd_sum(a+b); }
-struct RasterArgs { cfp C; cfp ns[6]; int W, H; cfp pred; int PW, PH; cfp prev; fp out; int BW, BH, reverse, iterations; };
-kernel void raster(constant RasterArgs& P [[buffer(0)]], KARGS) {
- cfp C=P.C,pred=P.pred,prev=P.prev; fp out=P.out;
- const int W=P.W,H=P.H,PW=P.PW,PH=P.PH,BW=P.BW,BH=P.BH,reverse=P.reverse,iterations=P.iterations;
- int by=blockIdx.x,t=threadIdx.x,d=blockIdx.y;
- cfp N=P.ns[d];out+=d*2*BW*BH;
- if(pred)pred+=d*2*PW*PH;if(prev)prev+=d*2*BW*BH;
- float lastu=0,lastv=0;
- for(int col=0;col<BW;col++){
- int bx=reverse?BW-1-col:col,px=bx*4+t%8,py0=by*4+t/8,py1=py0+4;
- float c0=at(C,px,py0,W,H),c1=at(C,px,py1,W,H),gx0=0,gy0=0,gx1=0,gy1=0;
- for(int j=-1;j<=1;j++){float k=j==0?2.f:1.f;
- gx0+=k*(at(C,px+1,py0+j,W,H)-at(C,px-1,py0+j,W,H));
- gy0+=k*(at(C,px+j,py0+1,W,H)-at(C,px+j,py0-1,W,H));
- gx1+=k*(at(C,px+1,py1+j,W,H)-at(C,px-1,py1+j,W,H));
- gy1+=k*(at(C,px+j,py1+1,W,H)-at(C,px+j,py1-1,W,H));}
- float aa=R(gx0*gx0,gx1*gx1),bb=R(gy0*gy0,gy1*gy1),ab=R(gx0*gy0,gx1*gy1);
- float gm=R(gx0,gx1)/64,hm=R(gy0,gy1)/64;
- float u=0,v=0;
- if(prev){u=prev[by*BW+bx];v=prev[BW*BH+by*BW+bx];}
- else if(pred){float xx=(bx*4+4+.5f)/2-.5f,yy=(by*4+4+.5f)/2-.5f;
- u=2*bil(pred,xx,yy,PW,PH);v=2*bil(pred+PW*PH,xx,yy,PW,PH);}
- float best=1e30f,bu=u,bv=v;
- for(int k=0;k<3;k++){
- float cu=u,cv=v;
- if(k==1){if(col==0)continue;cu=lastu;cv=lastv;}
- if(k==2){if(!prev||by+1>=BH)continue;cu=prev[(by+1)*BW+bx];cv=prev[BW*BH+(by+1)*BW+bx];}
- float d0=bil(N,px+cu,py0+cv,W,H)-c0,d1=bil(N,px+cu,py1+cv,W,H)-c1,ds=R(d0,d1),ss=R(d0*d0,d1*d1)-ds*ds/64;
- if(ss<best){best=ss;bu=cu;bv=cv;}
- }
- u=bu;v=bv;float det=fmax(aa*bb-ab*ab,.001f),prior=1e30f;
- for(int it=0;it<iterations;it++){
- float d0=bil(N,px+u,py0+v,W,H)-c0,d1=bil(N,px+u,py1+v,W,H)-c1,ds=R(d0,d1),ss=R(d0*d0,d1*d1)-ds*ds/64;
- float ax=R(d0*gx0,d1*gx1)-ds*gm,ay=R(d0*gy0,d1*gy1)-ds*hm;
- u-=(bb*ax-ab*ay)/det;v-=(aa*ay-ab*ax)/det;
- if(ss>=prior)break;prior=ss;
- }
- if(hypot2(u-bu,v-bv)>8){u=bu;v=bv;}
- lastu=u;lastv=v;
- if(t==0){out[by*BW+bx]=u;out[BW*BH+by*BW+bx]=v;}
- }
+static inline float sample_bilinear(in_plane plane, float x, float y, int width, int height) {
+    int x0 = (int)floor(x);
+    int y0 = (int)floor(y);
+    float fx = x - x0;
+    float fy = y - y0;
+    return (1 - fy) * ((1 - fx) * sample_clamped(plane, x0, y0, width, height) +
+                       fx * sample_clamped(plane, x0 + 1, y0, width, height)) +
+           fy * ((1 - fx) * sample_clamped(plane, x0, y0 + 1, width, height) +
+                 fx * sample_clamped(plane, x0 + 1, y0 + 1, width, height));
 }
-struct DenseArgs { cfp C; cfp ns[6]; cfp mv; fp f; int W, H, BW, BH; };
-kernel void dense(constant DenseArgs& P [[buffer(0)]], KARGS) {
- cfp C=P.C,N=P.ns[blockIdx.y],mv=P.mv; fp f=P.f; const int W=P.W,H=P.H,BW=P.BW,BH=P.BH;
- int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=W*H)return;int x=i%W,y=i/W;
- mv+=blockIdx.y*2*BW*BH;f+=blockIdx.y*2*W*H;
- float sx=0,sy=0,sw=0;
- // DIS-style photometric densification over patches covering this pixel.
- for(int by=imin(BH-1,imax(0,(y-7+3)/4));by<=imin(BH-1,y/4);by++)for(int bx=imin(BW-1,imax(0,(x-7+3)/4));bx<=imin(BW-1,x/4);bx++){
- float u=mv[by*BW+bx],v=mv[BW*BH+by*BW+bx];
- float w=1.f/fmax(1.f,fabs(bil(N,x+u,y+v,W,H)-C[i]));sx+=w*u;sy+=w*v;sw+=w;}
- f[i]=sx/fmax(sw,1e-6f);f[W*H+i]=sy/fmax(sw,1e-6f);
+
+// ------------------------------------------------------------------------------------------------ separable filters
+
+enum {
+    AXIS_X = 0,
+    AXIS_Y = 1
+};
+
+// separable_filter_<TAPS>_x / _y: one pass of a separable FIR filter with the tile in threadgroup memory
+// (flowdenoise.cu, separable_filter_tile). Grid (ceil(width / 32), ceil(height / 8), planes), 32 x 8 threads.
+struct SeparableFilterArgs {
+    in_plane src;
+    out_plane dst;
+    int width, height;
+    in_plane taps;
+    int zero_pad, prefilter_edges;
+};
+template <int TAPS, int AXIS>
+kernel void separable_filter_tile(constant SeparableFilterArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    constexpr int TILE_W = 32 + (AXIS == AXIS_X ? TAPS - 1 : 0);
+    constexpr int TILE_H = 8 + (AXIS == AXIS_Y ? TAPS - 1 : 0);
+    constexpr int tap_stride = AXIS == AXIS_X ? 1 : TILE_W;
+    threadgroup float tile[TILE_W * TILE_H];
+    in_plane src = args.src;
+    out_plane dst = args.dst;
+    const int width = args.width;
+    const int height = args.height;
+    in_plane taps = args.taps;
+    const int zero_pad = args.zero_pad;
+    const int prefilter_edges = args.prefilter_edges;
+
+    int thread_index = threadIdx.y * 32 + threadIdx.x;
+    int tile_x0 = blockIdx.x * 32;
+    int tile_y0 = blockIdx.y * 8;
+    src += blockIdx.z * width * height;
+    dst += blockIdx.z * width * height;
+    for (int j = thread_index; j < TILE_W * TILE_H; j += 256) {
+        int x = tile_x0 + j % TILE_W - (AXIS == AXIS_X ? TAPS / 2 : 0);
+        int y = tile_y0 + j / TILE_W - (AXIS == AXIS_Y ? TAPS / 2 : 0);
+        tile[j] = (zero_pad && (x < 0 || x >= width || y < 0 || y >= height))
+                      ? 0
+                      : src[clamp_index(y, height) * width + clamp_index(x, width)];
+    }
+    SYNC_THREADGROUP();
+
+    int x = tile_x0 + threadIdx.x;
+    int y = tile_y0 + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    float sum = 0;
+    if (TAPS % 2) {
+        int centre =
+            (threadIdx.y + (AXIS == AXIS_Y ? TAPS / 2 : 0)) * TILE_W + threadIdx.x + (AXIS == AXIS_X ? TAPS / 2 : 0);
+        sum = taps[TAPS / 2] * tile[centre];
+#pragma unroll
+        for (int j = 1; j <= TAPS / 2; j++) {
+            sum += taps[TAPS / 2 + j] * (tile[centre + j * tap_stride] + tile[centre - j * tap_stride]);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < TAPS; j++) {
+            sum += taps[j] *
+                   tile[(threadIdx.y + (AXIS == AXIS_Y ? j : 0)) * TILE_W + threadIdx.x + (AXIS == AXIS_X ? j : 0)];
+        }
+    }
+    // two edge-clamped [1 2 1] / 4 passes == the binomial-5 pass except at the first and last sample
+    if (TAPS == 5 && prefilter_edges) {
+        int position = AXIS == AXIS_X ? x : y;
+        int extent = AXIS == AXIS_X ? width : height;
+        int centre = (threadIdx.y + (AXIS == AXIS_Y ? 2 : 0)) * TILE_W + threadIdx.x + (AXIS == AXIS_X ? 2 : 0);
+        if (position == 0) {
+            sum += (tile[centre + tap_stride] - tile[centre]) * .0625f;
+        }
+        if (position == extent - 1) {
+            sum += (tile[centre - tap_stride] - tile[centre]) * .0625f;
+        }
+    }
+    dst[y * width + x] = sum;
 }
-static inline float lanc(float d) {d=fabs(d);if(d<1e-6f)return 1; if(d>=3)return 0;
- return sin(M_PI_F*d)*sin(M_PI_F*d/3)/(3.289868133696453f*d*d);}
-static inline float warp(cfp a,float x,float y,int W,int H) {
- int ix=(int)floor(x),iy=(int)floor(y);float wx[6],wy[6],sx=0,sy=0;
- #pragma unroll
- for(int k=0;k<6;k++){wx[k]=lanc(x-ix-k+2);wy[k]=lanc(y-iy-k+2);sx+=wx[k];sy+=wy[k];}
- float s=0;
- #pragma unroll
- for(int j=0;j<6;j++) {float row=0;
- #pragma unroll
- for(int k=0;k<6;k++)row+=wx[k]*at(a,ix+k-2,iy+j-2,W,H);s+=wy[j]*row;}
- return s/(sx*sy);
+#define SEPARABLE_FILTER(TAPS)                                                                              \
+    template [[host_name("separable_filter_" #TAPS "_x")]] kernel void separable_filter_tile<TAPS, AXIS_X>( \
+        constant SeparableFilterArgs&, uint3, uint3, uint3);                                                \
+    template [[host_name("separable_filter_" #TAPS "_y")]] kernel void separable_filter_tile<TAPS, AXIS_Y>( \
+        constant SeparableFilterArgs&, uint3, uint3, uint3);
+SEPARABLE_FILTER(3)
+SEPARABLE_FILTER(5)
+SEPARABLE_FILTER(7)
+SEPARABLE_FILTER(8)
+SEPARABLE_FILTER(19)
+SEPARABLE_FILTER(37)
+
+// separable_filter_any: one pass of a separable FIR filter with any number of taps, one thread per output sample
+// (flowdenoise.cu).
+struct SeparableFilterAnyArgs {
+    in_plane src;
+    out_plane dst;
+    int width, height, count;
+    in_plane taps;
+    int tap_count, axis, zero_pad;
+};
+kernel void separable_filter_any(constant SeparableFilterAnyArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    in_plane src = args.src;
+    out_plane dst = args.dst;
+    const int width = args.width;
+    const int height = args.height;
+    const int count = args.count;
+    const int tap_count = args.tap_count;
+    const int axis = args.axis;
+    const int zero_pad = args.zero_pad;
+    in_plane taps = args.taps;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+    int x = i % width;
+    int y = (i / width) % height;
+    int plane_start = i - y * width - x;
+    float sum = 0;
+    for (int j = 0; j < tap_count; j++) {
+        int xx = x + (axis == AXIS_X ? j - tap_count / 2 : 0);
+        int yy = y + (axis == AXIS_Y ? j - tap_count / 2 : 0);
+        if (!zero_pad || (xx >= 0 && xx < width && yy >= 0 && yy < height)) {
+            sum += taps[j] * src[plane_start + clamp_index(yy, height) * width + clamp_index(xx, width)];
+        }
+    }
+    dst[i] = sum;
 }
-static inline float2 warp2(cfp a,float x,float y,int W,int H) {
- int ix=(int)floor(x),iy=(int)floor(y);float wx[6],wy[6],sx=0,sy=0;
- #pragma unroll
- for(int k=0;k<6;k++){wx[k]=lanc(x-ix-k+2);wy[k]=lanc(y-iy-k+2);sx+=wx[k];sy+=wy[k];}
- float u=0,v=0;
- #pragma unroll
- for(int j=0;j<6;j++) {float ru=0,rv=0;
- #pragma unroll
- for(int k=0;k<6;k++){int p=cl(iy+j-2,H)*W+cl(ix+k-2,W);ru+=wx[k]*a[p];rv+=wx[k]*a[W*H+p];}
- u+=wy[j]*ru;v+=wy[j]*rv;}
- return float2(u/(sx*sy),v/(sx*sy));
+
+// ------------------------------------------------------------------------------------------------ motion pyramid
+
+// downsample_2x2: halves a plane by averaging each 2x2 block (flowdenoise.cu). One thread per output sample.
+struct DownsampleArgs {
+    in_plane src;
+    out_plane dst;
+    int width, height;
+};
+kernel void downsample_2x2(constant DownsampleArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    in_plane src = args.src;
+    out_plane dst = args.dst;
+    const int width = args.width;
+    const int height = args.height;
+    int out_w = width / 2;
+    int out_h = height / 2;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_w * out_h) {
+        return;
+    }
+    int p = (i / out_w * 2) * width + (i % out_w * 2);
+    dst[i] = (src[p] + src[p + 1] + src[p + width] + src[p + width + 1]) * .25f;
 }
-struct WarpYArgs { cfp n; cfp c; cfp f; fp yw; fp dd; fp speed; int W, H, FW, FH; float scale; };
-kernel void warp_y(constant WarpYArgs& P [[buffer(0)]], KARGS) {
- cfp n=P.n,c=P.c,f=P.f; fp yw=P.yw,dd=P.dd,speed=P.speed; const int W=P.W,H=P.H,FW=P.FW,FH=P.FH; const float scale=P.scale;
- int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=W*H)return;int x=i%W,y=i/W;
- float xx=(x+.5f)/scale-.5f,yy=(y+.5f)/scale-.5f;
- float u=bil(f,xx,yy,FW,FH)*scale,v=bil(f+FW*FH,xx,yy,FW,FH)*scale;
- float z=warp(n,x+u,y+v,W,H);yw[i]=z;dd[i]=fabs(z-c[i]);speed[i]=hypot2(u,v);
+
+// ------------------------------------------------------------------------------------------------ motion search
+
+// Sum over one 8x8 patch: each of the 32 lanes of the SIMD group holds two of its pixels (a, b), so the patch sum is
+// one hardware SIMD reduction, without threadgroup barriers. (CUDA: 64 threads, a shuffle tree per warp, then the two
+// warps: another summation order.)
+static inline float patch_sum(float a, float b) {
+    return simd_sum(a + b);
 }
-// Defer the five full-size temporal accumulator writes until all weights exist.
-struct WeightArgs { cfp yw; cfp low; cfp sad; cfp dd; cfp spread; cfp speed; fp wt; fp hp; int W, H; float th, dist, fast, spike; };
-kernel void weight_only(constant WeightArgs& P [[buffer(0)]], KARGS) {
- cfp yw=P.yw,low=P.low,sad=P.sad,dd=P.dd,spread=P.spread,speed=P.speed; fp wt=P.wt,hp=P.hp;
- const int W=P.W,H=P.H; const float th=P.th,dist=P.dist,fast=P.fast,spike=P.spike;
- int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=W*H)return;
- float tm=th/(1+speed[i]/dist/fast),s=sad[i]*16;
- float w=s<tm?(tm*tm-s*s)/(tm*tm+s*s):0;
- int x=i%W,y=i/W;float mx=0;
- for(int yy=-1;yy<=1;yy++)for(int xx=-1;xx<=1;xx++)mx=fmax(mx,at(dd,x+xx,y+yy,W,H));
- float t=spike*1.25f*spread[i];w*=sat((1.5f*t-mx)/fmax(.5f*t,.001f));
- wt[i]=w;hp[i]=yw[i]-low[i];
+
+// motion_search_sweep: DIS-style patch motion search on one pyramid level, one sweep along each row of patches
+// (flowdenoise.cu has the algorithm). Metal differences:
+// - one SIMD group of 32 threads per patch row; lane t holds the patch pixels (t % 8, t / 8) and (t % 8, t / 8 + 4)
+//   (suffixes 0 and 1 below), so every patch sum is patch_sum(pixel 0 term, pixel 1 term);
+// - the neighbours' levels come as up to 6 pointers (neighbours[d]) instead of one stacked copy.
+// Grid (patches_y, neighbours), 32 threads per threadgroup.
+struct MotionSearchArgs {
+    in_plane current;
+    in_plane neighbours[6];
+    int width, height;
+    in_plane coarse_flow;
+    int coarse_w, coarse_h;
+    in_plane forward;
+    out_plane vectors;
+    int patches_x, patches_y, reverse, iterations;
+};
+kernel void motion_search_sweep(constant MotionSearchArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    in_plane current = args.current;
+    in_plane coarse_flow = args.coarse_flow;
+    in_plane forward = args.forward;
+    out_plane vectors = args.vectors;
+    const int width = args.width;
+    const int height = args.height;
+    const int coarse_w = args.coarse_w;
+    const int coarse_h = args.coarse_h;
+    const int patches_x = args.patches_x;
+    const int patches_y = args.patches_y;
+    const int reverse = args.reverse;
+    const int iterations = args.iterations;
+    int patch_y = blockIdx.x;
+    int thread_index = threadIdx.x;
+    int neighbour = blockIdx.y;
+    in_plane other = args.neighbours[neighbour];
+    vectors += neighbour * 2 * patches_x * patches_y;
+    if (coarse_flow) {
+        coarse_flow += neighbour * 2 * coarse_w * coarse_h;
+    }
+    if (forward) {
+        forward += neighbour * 2 * patches_x * patches_y;
+    }
+    float last_u = 0;
+    float last_v = 0;
+    for (int col = 0; col < patches_x; col++) {
+        int patch_x = reverse ? patches_x - 1 - col : col;
+        int px = patch_x * 4 + thread_index % 8;
+        int py0 = patch_y * 4 + thread_index / 8;
+        int py1 = py0 + 4;
+
+        // template pixels and their Sobel gradients
+        float c0 = sample_clamped(current, px, py0, width, height);
+        float c1 = sample_clamped(current, px, py1, width, height);
+        float gx0 = 0;
+        float gy0 = 0;
+        float gx1 = 0;
+        float gy1 = 0;
+        for (int j = -1; j <= 1; j++) {
+            float sobel_w = j == 0 ? 2.f : 1.f;
+            gx0 += sobel_w * (sample_clamped(current, px + 1, py0 + j, width, height) -
+                              sample_clamped(current, px - 1, py0 + j, width, height));
+            gy0 += sobel_w * (sample_clamped(current, px + j, py0 + 1, width, height) -
+                              sample_clamped(current, px + j, py0 - 1, width, height));
+            gx1 += sobel_w * (sample_clamped(current, px + 1, py1 + j, width, height) -
+                              sample_clamped(current, px - 1, py1 + j, width, height));
+            gy1 += sobel_w * (sample_clamped(current, px + j, py1 + 1, width, height) -
+                              sample_clamped(current, px + j, py1 - 1, width, height));
+        }
+        float gxx = patch_sum(gx0 * gx0, gx1 * gx1);
+        float gyy = patch_sum(gy0 * gy0, gy1 * gy1);
+        float gxy = patch_sum(gx0 * gy0, gx1 * gy1);
+        float mean_gx = patch_sum(gx0, gx1) / 64;
+        float mean_gy = patch_sum(gy0, gy1) / 64;
+
+        // initial vector: forward sweep, else coarser level at the patch centre, else zero
+        float u = 0;
+        float v = 0;
+        if (forward) {
+            u = forward[patch_y * patches_x + patch_x];
+            v = forward[patches_x * patches_y + patch_y * patches_x + patch_x];
+        } else if (coarse_flow) {
+            float cx = (patch_x * 4 + 4 + .5f) / 2 - .5f;
+            float cy = (patch_y * 4 + 4 + .5f) / 2 - .5f;
+            u = 2 * sample_bilinear(coarse_flow, cx, cy, coarse_w, coarse_h);
+            v = 2 * sample_bilinear(coarse_flow + coarse_w * coarse_h, cx, cy, coarse_w, coarse_h);
+        }
+
+        // candidates: initial, previous patch of this sweep, (reverse sweep) the forward vector of the patch below
+        float best_ssd = 1e30f;
+        float best_u = u;
+        float best_v = v;
+        for (int cand = 0; cand < 3; cand++) {
+            float cand_u = u;
+            float cand_v = v;
+            if (cand == 1) {
+                if (col == 0) {
+                    continue;
+                }
+                cand_u = last_u;
+                cand_v = last_v;
+            }
+            if (cand == 2) {
+                if (!forward || patch_y + 1 >= patches_y) {
+                    continue;
+                }
+                cand_u = forward[(patch_y + 1) * patches_x + patch_x];
+                cand_v = forward[patches_x * patches_y + (patch_y + 1) * patches_x + patch_x];
+            }
+            float diff0 = sample_bilinear(other, px + cand_u, py0 + cand_v, width, height) - c0;
+            float diff1 = sample_bilinear(other, px + cand_u, py1 + cand_v, width, height) - c1;
+            float diff_sum = patch_sum(diff0, diff1);
+            float ssd = patch_sum(diff0 * diff0, diff1 * diff1) - diff_sum * diff_sum / 64;
+            if (ssd < best_ssd) {
+                best_ssd = ssd;
+                best_u = cand_u;
+                best_v = cand_v;
+            }
+        }
+
+        // inverse-compositional Gauss-Newton refinement (update applied before the convergence test)
+        u = best_u;
+        v = best_v;
+        float det = fmax(gxx * gyy - gxy * gxy, .001f);
+        float prev_ssd = 1e30f;
+        for (int it = 0; it < iterations; it++) {
+            float diff0 = sample_bilinear(other, px + u, py0 + v, width, height) - c0;
+            float diff1 = sample_bilinear(other, px + u, py1 + v, width, height) - c1;
+            float diff_sum = patch_sum(diff0, diff1);
+            float ssd = patch_sum(diff0 * diff0, diff1 * diff1) - diff_sum * diff_sum / 64;
+            float rx = patch_sum(diff0 * gx0, diff1 * gx1) - diff_sum * mean_gx;
+            float ry = patch_sum(diff0 * gy0, diff1 * gy1) - diff_sum * mean_gy;
+            u -= (gyy * rx - gxy * ry) / det;
+            v -= (gxx * ry - gxy * rx) / det;
+            if (ssd >= prev_ssd) {
+                break;
+            }
+            prev_ssd = ssd;
+        }
+        // reject a refinement that moved further than the patch size
+        if (hypot2(u - best_u, v - best_v) > 8) {
+            u = best_u;
+            v = best_v;
+        }
+        last_u = u;
+        last_v = v;
+        if (thread_index == 0) {
+            vectors[patch_y * patches_x + patch_x] = u;
+            vectors[patches_x * patches_y + patch_y * patches_x + patch_x] = v;
+        }
+    }
 }
-struct ReduceArgs { cfp y; cfp hc; cfp yw; cfp wt; cfp hp; fp acc; fp ws; fp sq; fp hs; fp ha; int N, D; };
-kernel void reduce_frames(constant ReduceArgs& P [[buffer(0)]], KARGS) {
- cfp y=P.y,hc=P.hc,yw=P.yw,wt=P.wt,hp=P.hp; fp acc=P.acc,ws=P.ws,sq=P.sq,hs=P.hs,ha=P.ha; const int N=P.N,D=P.D;
- int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=N)return;
- float a=y[i],w=1,s=1,h=hc[i],ab=fabs(h);
- for(int d=0;d<D;d++){int j=d*N+i;float ww=wt[j],hh=hp[j];a+=ww*yw[j];w+=ww;s+=ww*ww;h+=ww*hh;ab+=ww*fabs(hh);}
- acc[i]=a;ws[i]=w;sq[i]=s;hs[i]=h;ha[i]=ab;
+
+// densify_flow: dense flow of one level from the overlapping patch vectors, each weighted by
+// 1 / max(1, photometric error) (flowdenoise.cu). Grid (ceil(width * height / 256), neighbours); the neighbours'
+// levels come as pointers.
+struct DensifyArgs {
+    in_plane current;
+    in_plane neighbours[6];
+    in_plane vectors;
+    out_plane flow;
+    int width, height, patches_x, patches_y;
+};
+kernel void densify_flow(constant DensifyArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    in_plane current = args.current;
+    in_plane neighbour = args.neighbours[blockIdx.y];
+    in_plane vectors = args.vectors;
+    out_plane flow = args.flow;
+    const int width = args.width;
+    const int height = args.height;
+    const int patches_x = args.patches_x;
+    const int patches_y = args.patches_y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width * height) {
+        return;
+    }
+    int x = i % width;
+    int y = i / width;
+    vectors += blockIdx.y * 2 * patches_x * patches_y;
+    flow += blockIdx.y * 2 * width * height;
+    float sum_u = 0;
+    float sum_v = 0;
+    float sum_w = 0;
+    // patches with a top-left corner in [x - 7, x] x [y - 7, y], clamped to the patch grid
+    for (int py = min_int(patches_y - 1, max_int(0, (y - 7 + 3) / 4)); py <= min_int(patches_y - 1, y / 4); py++) {
+        for (int px = min_int(patches_x - 1, max_int(0, (x - 7 + 3) / 4)); px <= min_int(patches_x - 1, x / 4); px++) {
+            float u = vectors[py * patches_x + px];
+            float v = vectors[patches_x * patches_y + py * patches_x + px];
+            float w = 1.f / fmax(1.f, fabs(sample_bilinear(neighbour, x + u, y + v, width, height) - current[i]));
+            sum_u += w * u;
+            sum_v += w * v;
+            sum_w += w;
+        }
+    }
+    flow[i] = sum_u / fmax(sum_w, 1e-6f);
+    flow[width * height + i] = sum_v / fmax(sum_w, 1e-6f);
 }
-struct ChromaArgs { cfp n; cfp f; cfp wt; fp a; fp ws; int W, H, FW, FH; float scale; };
-kernel void chroma(constant ChromaArgs& P [[buffer(0)]], KARGS) {
- cfp n=P.n,f=P.f,wt=P.wt; fp a=P.a,ws=P.ws; const int W=P.W,H=P.H,FW=P.FW,FH=P.FH; const float scale=P.scale;
- int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=W*H)return;int x=i%W,y=i/W;
- // Average full-resolution flow over each 2x2 luma footprint (linear sampling
- // is identical except at the clamped outermost half-flow pixel).
- float u=0,v=0;
- for(int yy=0;yy<2;yy++)for(int xx=0;xx<2;xx++){
- float fx=(2*x+xx+.5f)/scale-.5f,fy=(2*y+yy+.5f)/scale-.5f;
- u+=bil(f,fx,fy,FW,FH)*scale*.125f;v+=bil(f+FW*FH,fx,fy,FW,FH)*scale*.125f;}
- int p=2*y*2*W+2*x;float w=(wt[p]+wt[p+1]+wt[p+2*W]+wt[p+2*W+1])*.25f;
- float2 z=warp2(n,x+u,y+v,W,H);a[i]+=w*z.x;a[W*H+i]+=w*z.y;ws[i]+=w;
+
+// ------------------------------------------------------------------------------------------------ Lanczos-3 warp
+
+// Lanczos-3 kernel sin(pi d) sin(pi d / 3) / (pi^2 d^2 / 3); sin(pi x) instead of CUDA's sinpif (fast math).
+static inline float lanczos3(float offset) {
+    offset = fabs(offset);
+    if (offset < 1e-6f) {
+        return 1;
+    }
+    if (offset >= 3) {
+        return 0;
+    }
+    return sin(M_PI_F * offset) * sin(M_PI_F * offset / 3) / (3.289868133696453f * offset * offset);
+}
+// separable Lanczos-3 sample, 6 x 6 taps, normalised weights, edges clamped (flowdenoise.cu)
+static inline float sample_lanczos3(in_plane plane, float x, float y, int width, int height) {
+    int x0 = (int)floor(x);
+    int y0 = (int)floor(y);
+    float wx[6];
+    float wy[6];
+    float sum_wx = 0;
+    float sum_wy = 0;
+#pragma unroll
+    for (int k = 0; k < 6; k++) {
+        wx[k] = lanczos3(x - x0 - k + 2);
+        wy[k] = lanczos3(y - y0 - k + 2);
+        sum_wx += wx[k];
+        sum_wy += wy[k];
+    }
+    float sum = 0;
+#pragma unroll
+    for (int j = 0; j < 6; j++) {
+        float row = 0;
+#pragma unroll
+        for (int k = 0; k < 6; k++) {
+            row += wx[k] * sample_clamped(plane, x0 + k - 2, y0 + j - 2, width, height);
+        }
+        sum += wy[j] * row;
+    }
+    return sum / (sum_wx * sum_wy);
+}
+// sample_lanczos3 of the U and V planes at once (V at planes + width * height)
+static inline float2 sample_lanczos3_pair(in_plane planes, float x, float y, int width, int height) {
+    int x0 = (int)floor(x);
+    int y0 = (int)floor(y);
+    float wx[6];
+    float wy[6];
+    float sum_wx = 0;
+    float sum_wy = 0;
+#pragma unroll
+    for (int k = 0; k < 6; k++) {
+        wx[k] = lanczos3(x - x0 - k + 2);
+        wy[k] = lanczos3(y - y0 - k + 2);
+        sum_wx += wx[k];
+        sum_wy += wy[k];
+    }
+    float sum_u = 0;
+    float sum_v = 0;
+#pragma unroll
+    for (int j = 0; j < 6; j++) {
+        float row_u = 0;
+        float row_v = 0;
+#pragma unroll
+        for (int k = 0; k < 6; k++) {
+            int p = clamp_index(y0 + j - 2, height) * width + clamp_index(x0 + k - 2, width);
+            row_u += wx[k] * planes[p];
+            row_v += wx[k] * planes[width * height + p];
+        }
+        sum_u += wy[j] * row_u;
+        sum_v += wy[j] * row_v;
+    }
+    return float2(sum_u / (sum_wx * sum_wy), sum_v / (sum_wx * sum_wy));
+}
+
+// warp_luma: one neighbour's luma aligned to the current frame, |warped - current| and the flow speed
+// (flowdenoise.cu). One thread per luma pixel.
+struct WarpLumaArgs {
+    in_plane neighbour;
+    in_plane current;
+    in_plane flow;
+    out_plane warped;
+    out_plane abs_diff;
+    out_plane speed;
+    int width, height, flow_w, flow_h;
+    float scale;
+};
+kernel void warp_luma(constant WarpLumaArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    in_plane neighbour = args.neighbour;
+    in_plane current = args.current;
+    in_plane flow = args.flow;
+    out_plane warped = args.warped;
+    out_plane abs_diff = args.abs_diff;
+    out_plane speed = args.speed;
+    const int width = args.width;
+    const int height = args.height;
+    const int flow_w = args.flow_w;
+    const int flow_h = args.flow_h;
+    const float scale = args.scale;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width * height) {
+        return;
+    }
+    int x = i % width;
+    int y = i / width;
+    float fx = (x + .5f) / scale - .5f;
+    float fy = (y + .5f) / scale - .5f;
+    float u = sample_bilinear(flow, fx, fy, flow_w, flow_h) * scale;
+    float v = sample_bilinear(flow + flow_w * flow_h, fx, fy, flow_w, flow_h) * scale;
+    float z = sample_lanczos3(neighbour, x + u, y + v, width, height);
+    warped[i] = z;
+    abs_diff[i] = fabs(z - current[i]);
+    speed[i] = hypot2(u, v);
+}
+
+// ------------------------------------------------------------------------------------------------ weights, fusion
+
+// temporal_weight: MVTools DegrainWeight on the block SAD with a motion-dependent threshold, times the spike
+// rejection factor; also the neighbour's fine detail (flowdenoise.cu). One thread per luma pixel.
+struct TemporalWeightArgs {
+    in_plane warped;
+    in_plane warped_low;
+    in_plane sad;
+    in_plane abs_diff;
+    in_plane abs_diff_mean;
+    in_plane speed;
+    out_plane weight;
+    out_plane warped_high;
+    int width, height;
+    float thsad, frame_distance, fast_th, spike;
+};
+kernel void temporal_weight(constant TemporalWeightArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    in_plane warped = args.warped;
+    in_plane warped_low = args.warped_low;
+    in_plane sad = args.sad;
+    in_plane abs_diff = args.abs_diff;
+    in_plane abs_diff_mean = args.abs_diff_mean;
+    in_plane speed = args.speed;
+    out_plane weight = args.weight;
+    out_plane warped_high = args.warped_high;
+    const int width = args.width;
+    const int height = args.height;
+    const float thsad = args.thsad;
+    const float frame_distance = args.frame_distance;
+    const float fast_th = args.fast_th;
+    const float spike = args.spike;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width * height) {
+        return;
+    }
+    float threshold = thsad / (1 + speed[i] / frame_distance / fast_th);
+    float block_sad = sad[i] * 16;
+    float w = block_sad < threshold
+                  ? (threshold * threshold - block_sad * block_sad) / (threshold * threshold + block_sad * block_sad)
+                  : 0;
+    int x = i % width;
+    int y = i / width;
+    float largest = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            largest = fmax(largest, sample_clamped(abs_diff, x + dx, y + dy, width, height));
+        }
+    }
+    float t = spike * 1.25f * abs_diff_mean[i];
+    w *= saturate_unit((1.5f * t - largest) / fmax(.5f * t, .001f));
+    weight[i] = w;
+    warped_high[i] = warped[i] - warped_low[i];
+}
+
+// fuse_frames: the temporal sums of the luma, the current frame with weight 1 and each neighbour in order
+// (flowdenoise.cu). One thread per luma pixel.
+struct FuseFramesArgs {
+    in_plane current;
+    in_plane current_high;
+    in_plane warped;
+    in_plane weights;
+    in_plane warped_high;
+    out_plane weighted_sum;
+    out_plane weight_sum;
+    out_plane weight_sq_sum;
+    out_plane high_sum;
+    out_plane high_abs_sum;
+    int count, neighbour_count;
+};
+kernel void fuse_frames(constant FuseFramesArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    in_plane current = args.current;
+    in_plane current_high = args.current_high;
+    in_plane warped = args.warped;
+    in_plane weights = args.weights;
+    in_plane warped_high = args.warped_high;
+    out_plane weighted_sum = args.weighted_sum;
+    out_plane weight_sum = args.weight_sum;
+    out_plane weight_sq_sum = args.weight_sq_sum;
+    out_plane high_sum = args.high_sum;
+    out_plane high_abs_sum = args.high_abs_sum;
+    const int count = args.count;
+    const int neighbour_count = args.neighbour_count;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+    float acc = current[i];
+    float w_sum = 1;
+    float w_sq_sum = 1;
+    float h_sum = current_high[i];
+    float h_abs_sum = fabs(h_sum);
+    for (int d = 0; d < neighbour_count; d++) {
+        int j = d * count + i;
+        float w = weights[j];
+        float h = warped_high[j];
+        acc += w * warped[j];
+        w_sum += w;
+        w_sq_sum += w * w;
+        h_sum += w * h;
+        h_abs_sum += w * fabs(h);
+    }
+    weighted_sum[i] = acc;
+    weight_sum[i] = w_sum;
+    weight_sq_sum[i] = w_sq_sum;
+    high_sum[i] = h_sum;
+    high_abs_sum[i] = h_abs_sum;
+}
+
+// warp_accumulate_chroma: one neighbour's chroma aligned with the 2x2-averaged luma flow and weights, added to the
+// chroma sums (flowdenoise.cu). One thread per chroma pixel; width x height is the chroma size.
+struct WarpChromaArgs {
+    in_plane neighbour;
+    in_plane flow;
+    in_plane weight;
+    out_plane sums;
+    out_plane weight_sum;
+    int width, height, flow_w, flow_h;
+    float scale;
+};
+kernel void warp_accumulate_chroma(constant WarpChromaArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    in_plane neighbour = args.neighbour;
+    in_plane flow = args.flow;
+    in_plane weight = args.weight;
+    out_plane sums = args.sums;
+    out_plane weight_sum = args.weight_sum;
+    const int width = args.width;
+    const int height = args.height;
+    const int flow_w = args.flow_w;
+    const int flow_h = args.flow_h;
+    const float scale = args.scale;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width * height) {
+        return;
+    }
+    int x = i % width;
+    int y = i / width;
+    float u = 0;
+    float v = 0;
+    for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+            float fx = (2 * x + dx + .5f) / scale - .5f;
+            float fy = (2 * y + dy + .5f) / scale - .5f;
+            u += sample_bilinear(flow, fx, fy, flow_w, flow_h) * scale * .125f;
+            v += sample_bilinear(flow + flow_w * flow_h, fx, fy, flow_w, flow_h) * scale * .125f;
+        }
+    }
+    // luma index of (2x, 2y); the luma plane is 2 * width wide
+    int p = 2 * y * 2 * width + 2 * x;
+    float w = (weight[p] + weight[p + 1] + weight[p + 2 * width] + weight[p + 2 * width + 1]) * .25f;
+    float2 z = sample_lanczos3_pair(neighbour, x + u, y + v, width, height);
+    sums[i] += w * z.x;
+    sums[width * height + i] += w * z.y;
+    weight_sum[i] += w;
 }

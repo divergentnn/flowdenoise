@@ -1,0 +1,24 @@
+# Style of the CUDA and Metal kernels (flowdenoise-core/kernels). Apply with:
+#   clang-format -i flowdenoise-core/kernels/*.cu flowdenoise-core/kernels/*.h flowdenoise-core/kernels/metal/*.metal
+---
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -4
+DerivePointerAlignment: false
+PointerAlignment: Left
+# one statement per line, braces everywhere
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Empty
+AllowShortEnumsOnASingleLine: false
+InsertBraces: true
+# keep hand-laid-out comments and the include order
+ReflowComments: false
+SortIncludes: Never
+IncludeBlocks: Preserve
+AlignEscapedNewlines: Left
+SpacesBeforeTrailingComments: 2

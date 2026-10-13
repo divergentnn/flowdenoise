@@ -1,160 +1,397 @@
-// flowdenoise elementwise, copy and order-statistic kernels in Metal Shading Language (compiled WITHOUT fast math):
-// flowdenoise_ops.cu mapped to MSL, plus the copy / fill kernels of the Metal driver. Each kernel takes its CUDA
-// argument list as one constant struct (same order, C layout; device pointers inside it). Moved verbatim from GRAIL
-// (kernels/metal/grail.metal).
+// flowdenoise_ops.metal: the elementwise and order-statistic kernels in Metal Shading Language (a port of
+// flowdenoise_ops.cu; read the kernel descriptions there), plus the copy and fill kernels of the Metal driver.
+//
+// Compiled WITHOUT fast math, as the CUDA file. Each kernel takes its CUDA argument list as one constant struct
+// (same order, C layout, device pointers inside it, packed by the host). Elementwise kernels: one thread per
+// element, 1-D grid of 256-thread threadgroups; the index is 32 bit (every buffer here has fewer than 2^32 elements,
+// and 64-bit division is slow on the GPU).
 #include <metal_stdlib>
 using namespace metal;
 
-#define KARGS uint3 blockIdx [[threadgroup_position_in_grid]], uint3 threadIdx [[thread_position_in_threadgroup]], \
-              uint3 blockDim [[threads_per_threadgroup]], uint3 gridDim [[threadgroups_per_grid]], \
-              uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
-#define SYNC() threadgroup_barrier(mem_flags::mem_threadgroup)
-// 32-bit element index (every buffer here has fewer than 2^32 elements; 64-bit division is slow on the GPU)
-#define IDX                                                     \
-    uint i = blockIdx.x * blockDim.x + threadIdx.x;             \
-    if (i >= (ulong)n) return;
-typedef device const float* cfp;
-typedef device float* fp;
-typedef device const uchar* cbp;
-typedef device uchar* bp;
+#define KERNEL_INDICES                                                                                   \
+    uint3 blockIdx [[threadgroup_position_in_grid]], uint3 threadIdx [[thread_position_in_threadgroup]], \
+        uint3 blockDim [[threads_per_threadgroup]], uint3 gridDim [[threadgroups_per_grid]],             \
+        uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
+#define SYNC_THREADGROUP() threadgroup_barrier(mem_flags::mem_threadgroup)
+// the element index of this thread; threads past the end return
+#define ELEMENT_INDEX                               \
+    uint i = blockIdx.x * blockDim.x + threadIdx.x; \
+    if (i >= (ulong)count) {                        \
+        return;                                     \
+    }
+typedef device const float* in_plane;
+typedef device float* out_plane;
+typedef device const uchar* in_bytes;
+typedef device uchar* out_bytes;
 
-static inline float mul_rn(float a, float b) { return fma(a, b, 0.0f); }
+static inline float saturate_unit(float value) {
+    return fmin(1.f, fmax(0.f, value));
+}
 
 // ------------------------------------------------------------------------------------------------ copies (driver)
-struct CopyArgs { device uint* d; device const uint* s; long n; };
-kernel void copy_u32(constant CopyArgs& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.d[i] = P.s[i]; }
-struct CopyBArgs { bp d; cbp s; long n; };
-kernel void copy_u8(constant CopyBArgs& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.d[i] = P.s[i]; }
-struct FillArgs { bp d; int v; long n; };
-kernel void fill_u8(constant FillArgs& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.d[i] = (uchar)P.v; }
+
+// dst[i] = src[i] over count 32-bit words (device-to-device and staged host-to-device copies)
+struct CopyWordsArgs {
+    device uint* dst;
+    device const uint* src;
+    long count;
+};
+kernel void copy_words(constant CopyWordsArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.dst[i] = args.src[i];
+}
+// dst[i] = src[i] over count bytes (unaligned copies)
+struct CopyBytesArgs {
+    out_bytes dst;
+    in_bytes src;
+    long count;
+};
+kernel void copy_bytes(constant CopyBytesArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.dst[i] = args.src[i];
+}
+// dst[i] = value over count bytes (memset)
+struct FillBytesArgs {
+    out_bytes dst;
+    int value;
+    long count;
+};
+kernel void fill_bytes(constant FillBytesArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.dst[i] = (uchar)args.value;
+}
 
 // ------------------------------------------------------------------------------------------------ conversions
-struct ConvArgs { device const ushort* a; fp b; long n; };
-kernel void u16_to_f32(constant ConvArgs& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.b[i] = (float)P.a[i]; }
 
-// ------------------------------------------------------------------------------------------------ flowdegrain2 (CuPy)
-struct EW2 { cfp a; cfp b; fp c; long n; };
-struct EW1 { cfp a; fp c; long n; };
-kernel void ew_absdiff(constant EW2& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.c[i] = fabs(P.a[i] - P.b[i]); }
-kernel void ew_energy(constant EW2& P [[buffer(0)]], KARGS) {
-    long n = P.n; IDX float d = P.a[i] - P.b[i]; P.c[i] = d * d;
+// 10-bit codes (uint16) to float
+struct U16ToFloatArgs {
+    device const ushort* src;
+    out_plane dst;
+    long count;
+};
+kernel void u16_to_float(constant U16ToFloatArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.dst[i] = (float)args.src[i];
 }
-kernel void ew_sub(constant EW2& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.c[i] = P.a[i] - P.b[i]; }
-kernel void ew_sqr(constant EW1& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.c[i] = P.a[i] * P.a[i]; }
-kernel void ew_abs(constant EW1& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.c[i] = fabs(P.a[i]); }
-// c = a / b[i % m]
-struct DivArgs { cfp a; cfp b; fp c; long n; long m; };
-kernel void ew_div_bc(constant DivArgs& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.c[i] = P.a[i] / P.b[i % (uint)P.m]; }
-// motion pyramid base: clip(rint(g / 4), 0, 255)
-kernel void ew_q8(constant EW1& P [[buffer(0)]], KARGS) {
-    long n = P.n; IDX float v = rint(P.a[i] / 4.f); P.c[i] = v < 0.f ? 0.f : (v > 255.f ? 255.f : v);
+
+// unary elementwise kernels: out = f(a)
+struct UnaryArgs {
+    in_plane a;
+    out_plane out;
+    long count;
+};
+// binary elementwise kernels: out = f(a, b)
+struct BinaryArgs {
+    in_plane a;
+    in_plane b;
+    out_plane out;
+    long count;
+};
+
+// motion pyramid base: clip(rint(x / 4), 0, 255)
+kernel void quantize_8bit(constant UnaryArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    float v = rint(args.a[i] / 4.f);
+    args.out[i] = v < 0.f ? 0.f : (v > 255.f ? 255.f : v);
 }
-kernel void ew_rint(constant EW1& P [[buffer(0)]], KARGS) { long n = P.n; IDX P.c[i] = rint(P.a[i]); }
-// GUIDE: v = max(m2 - m m, 0); a = v / (v + eps); b = m - a m   (eps per plane: eps[i / ps])
-struct GuideArgs { cfp m; cfp m2; cfp eps; fp a; fp b; long n; long ps; };
-kernel void ew_guide(constant GuideArgs& P [[buffer(0)]], KARGS) {
-    long n = P.n; IDX float e = P.eps[i / (uint)P.ps], mm = P.m[i];
-    float v = fmax(P.m2[i] - mm * mm, 0.f);
-    float aa = v / (v + e);
-    P.a[i] = aa; P.b[i] = mm - aa * mm;
+// rint (ties to even)
+kernel void round_to_integer(constant UnaryArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.out[i] = rint(args.a[i]);
 }
-// ALPHA: a = sat((fallback - ws^2 / sq) / (fallback - 1))
-struct AlphaArgs { cfp ws; cfp sq; float fallback; fp a; long n; };
-kernel void ew_alpha(constant AlphaArgs& P [[buffer(0)]], KARGS) {
-    long n = P.n; const float fb = P.fallback;
-    IDX P.a[i] = fmin(1.f, fmax(0.f, (fb - P.ws[i] * P.ws[i] / P.sq[i]) / (fb - 1)));
+
+// ------------------------------------------------------------------------------------------------ elementwise
+
+// |a - b|
+kernel void abs_diff(constant BinaryArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.out[i] = fabs(args.a[i] - args.b[i]);
 }
-// BLEND: y = x + a (ga x + gb - x), alpha broadcast (a[i % am])
-struct BlendArgs { cfp x; cfp a; cfp ga; cfp gb; fp y; long n; long am; };
-kernel void ew_blend(constant BlendArgs& P [[buffer(0)]], KARGS) {
-    long n = P.n; IDX float xx = P.x[i]; P.y[i] = xx + P.a[i % (uint)P.am] * (P.ga[i] * xx + P.gb[i] - xx);
+// (a - b)^2
+kernel void squared_diff(constant BinaryArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    float d = args.a[i] - args.b[i];
+    args.out[i] = d * d;
 }
-// FINISH (detail gate) -> 10-bit luma
-struct FinishArgs { cfp y_; cfp lo_; cfp hc_; cfp hs_; cfp ha_; cfp sq_; cfp ws_; cfp e_; cfp efp; float c0, boost;
-                    device short* out; long n; };
-kernel void ew_finish(constant FinishArgs& P [[buffer(0)]], KARGS) {
-    long n = P.n; const float c0 = P.c0, boost = P.boost;
-    IDX float y = P.y_[i], lo = P.lo_[i], hc = P.hc_[i], hs = P.hs_[i], ha = P.ha_[i], sq = P.sq_[i], ws = P.ws_[i], e = P.e_[i];
-    float ef = *P.efp;
-    float cn = sqrt(sq) / ws;
-    float co = fmin(1.f, fmax(0.f, (hs / fmax(ha, 1e-6f) - cn) / fmax(1 - cn, .05f)));
-    float tm = fmin(1.f, fmax(0.f, (e / fmax(ef, 1e-6f) - 3) / 3));
-    float gate = fmin(1.f, fmax(0.f, (co - c0) / (1 - c0))) * tm;
-    float z = lo + gate * (1 + (boost - 1) * tm) * hc + (1 - gate) * (y - lo);
-    P.out[i] = (short)(int)rint(fmin(1023.f, fmax(0.f, z)));
+// a - b
+kernel void subtract(constant BinaryArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.out[i] = args.a[i] - args.b[i];
 }
-struct PackArgs { cfp a; device short* b; long n; };
-kernel void ew_pack(constant PackArgs& P [[buffer(0)]], KARGS) {
-    long n = P.n; IDX P.b[i] = (short)(int)rint(fmin(1023.f, fmax(0.f, P.a[i])));
+// a^2
+kernel void square(constant UnaryArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.out[i] = args.a[i] * args.a[i];
+}
+// |a|
+kernel void absolute(constant UnaryArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.out[i] = fabs(args.a[i]);
+}
+// out = a / b[i % period]
+struct DivideBroadcastArgs {
+    in_plane a;
+    in_plane b;
+    out_plane out;
+    long count;
+    long period;
+};
+kernel void divide_broadcast(constant DivideBroadcastArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.out[i] = args.a[i] / args.b[i % (uint)args.period];
+}
+
+// ------------------------------------------------------------------------------------------------ guided fallback
+
+// guided filter coefficients: variance = max(mean_sq - mean^2, 0); a = variance / (variance + eps); b = mean - a mean
+// (eps per plane: eps[i / plane_size])
+struct GuidedCoefficientsArgs {
+    in_plane mean;
+    in_plane mean_sq;
+    in_plane eps;
+    out_plane a;
+    out_plane b;
+    long count;
+    long plane_size;
+};
+kernel void guided_coefficients(constant GuidedCoefficientsArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    float e = args.eps[i / (uint)args.plane_size];
+    float m = args.mean[i];
+    float variance = fmax(args.mean_sq[i] - m * m, 0.f);
+    float coef_a = variance / (variance + e);
+    args.a[i] = coef_a;
+    args.b[i] = m - coef_a * m;
+}
+// fallback blend factor: clamp((fallback - weight_sum^2 / weight_sq_sum) / (fallback - 1), 0, 1)
+struct FallbackAlphaArgs {
+    in_plane weight_sum;
+    in_plane weight_sq_sum;
+    float fallback;
+    out_plane alpha;
+    long count;
+};
+kernel void fallback_alpha(constant FallbackAlphaArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    const float fallback = args.fallback;
+    ELEMENT_INDEX
+    args.alpha[i] =
+        saturate_unit((fallback - args.weight_sum[i] * args.weight_sum[i] / args.weight_sq_sum[i]) / (fallback - 1));
+}
+// out = x + alpha (mean_a x + mean_b - x), alpha broadcast (alpha[i % alpha_period])
+struct GuidedBlendArgs {
+    in_plane x;
+    in_plane alpha;
+    in_plane mean_a;
+    in_plane mean_b;
+    out_plane out;
+    long count;
+    long alpha_period;
+};
+kernel void guided_blend(constant GuidedBlendArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    float v = args.x[i];
+    args.out[i] = v + args.alpha[i % (uint)args.alpha_period] * (args.mean_a[i] * v + args.mean_b[i] - v);
+}
+
+// ------------------------------------------------------------------------------------------------ detail gate, output
+
+// detail gate and output luma (flowdenoise_ops.cu, detail_gate_luma)
+struct DetailGateArgs {
+    in_plane fused;
+    in_plane fused_low;
+    in_plane current_high;
+    in_plane high_sum_smooth;
+    in_plane high_abs_sum_smooth;
+    in_plane weight_sq_sum;
+    in_plane weight_sum;
+    in_plane energy;
+    in_plane energy_floor;
+    float gate_threshold, boost;
+    device short* out;
+    long count;
+};
+kernel void detail_gate_luma(constant DetailGateArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    const float gate_threshold = args.gate_threshold;
+    const float boost = args.boost;
+    ELEMENT_INDEX
+    float y = args.fused[i];
+    float low = args.fused_low[i];
+    float high = args.current_high[i];
+    float h_sum = args.high_sum_smooth[i];
+    float h_abs_sum = args.high_abs_sum_smooth[i];
+    float w_sq_sum = args.weight_sq_sum[i];
+    float w_sum = args.weight_sum[i];
+    float e = args.energy[i];
+    float e_floor = *args.energy_floor;
+    float noise_coherence = sqrt(w_sq_sum) / w_sum;
+    float coherence =
+        saturate_unit((h_sum / fmax(h_abs_sum, 1e-6f) - noise_coherence) / fmax(1 - noise_coherence, .05f));
+    float texture = saturate_unit((e / fmax(e_floor, 1e-6f) - 3) / 3);
+    float gate = saturate_unit((coherence - gate_threshold) / (1 - gate_threshold)) * texture;
+    float z = low + gate * (1 + (boost - 1) * texture) * high + (1 - gate) * (y - low);
+    args.out[i] = (short)(int)rint(fmin(1023.f, fmax(0.f, z)));
+}
+// float to int16, rounded (ties to even) and clamped to 0 ... 1023
+struct Pack10BitArgs {
+    in_plane src;
+    device short* dst;
+    long count;
+};
+kernel void pack_10bit(constant Pack10BitArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.dst[i] = (short)(int)rint(fmin(1023.f, fmax(0.f, args.src[i])));
 }
 
 // ------------------------------------------------------------------------------------------------ order statistics
-// Radix select on order-preserving uint32 keys of floats: 4 passes of 8 bits, state on the device (no host sync).
-static inline uint fkey(float f) {
+// 4-pass radix select on order-preserving keys (flowdenoise_ops.cu). state[0] = key prefix, state[1] = rank left.
+
+static inline uint float_to_ordered_key(float f) {
     uint u = as_type<uint>(f);
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
-static inline float fkey_inv(uint k) {
-    uint u = (k & 0x80000000u) ? (k & 0x7fffffffu) : ~k;
+static inline float ordered_key_to_float(uint key) {
+    uint u = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
     return as_type<float>(u);
 }
-// out[p * m + j] = |x[p * ps + j * stride]|  (hp[:, ::stride] of the reference, abs) or the value itself (absv = 0)
-struct GatherArgs { cfp x; fp out; long ps; long stride; long m; int planes, absv; };
-kernel void gather_stride(constant GatherArgs& P [[buffer(0)]], KARGS) {
-    long n = P.m * P.planes;
-    IDX uint m = (uint)P.m, p = i / m, j = i % m;
-    float v = P.x[p * P.ps + j * P.stride];
-    P.out[i] = P.absv ? fabs(v) : v;
+// out[p * m + j] = |x[p * plane_size + j * stride]| (or the value itself with take_abs = 0)
+struct GatherStridedArgs {
+    in_plane x;
+    out_plane out;
+    long plane_size;
+    long stride;
+    long m;
+    int planes, take_abs;
+};
+kernel void gather_strided(constant GatherStridedArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.m * args.planes;
+    ELEMENT_INDEX
+    uint m = (uint)args.m;
+    uint p = i / m;
+    uint j = i % m;
+    float v = args.x[p * args.plane_size + j * args.stride];
+    args.out[i] = args.take_abs ? fabs(v) : v;
 }
-struct SelInitArgs { device uint* st; device uint* hist; uint k; };
-kernel void sel_init(constant SelInitArgs& P [[buffer(0)]], KARGS) {
+struct RadixSelectInitArgs {
+    device uint* state;
+    device uint* histogram;
+    uint k;
+};
+kernel void radix_select_init(constant RadixSelectInitArgs& args [[buffer(0)]], KERNEL_INDICES) {
     uint t = threadIdx.x;
-    if (t == 0) { P.st[0] = 0; P.st[1] = P.k; }
-    for (uint b = t; b < 256; b += blockDim.x) P.hist[b] = 0;
-}
-struct SelHistArgs { cfp v; long n; device const uint* st; device atomic_uint* hist; int shift; };
-kernel void sel_hist(constant SelHistArgs& P [[buffer(0)]], KARGS) {
-    threadgroup atomic_uint h[256];
-    for (uint b = threadIdx.x; b < 256; b += blockDim.x) atomic_store_explicit(&h[b], 0u, memory_order_relaxed);
-    SYNC();
-    const int shift = P.shift;
-    uint prefix = P.st[0];
-    uint maskhi = shift >= 24 ? 0u : (0xffffffffu << (shift + 8));
-    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < P.n; i += (long)gridDim.x * blockDim.x) {
-        uint k = fkey(P.v[i]);
-        if ((k & maskhi) == (prefix & maskhi)) atomic_fetch_add_explicit(&h[(k >> shift) & 255u], 1u, memory_order_relaxed);
+    if (t == 0) {
+        args.state[0] = 0;
+        args.state[1] = args.k;
     }
-    SYNC();
+    for (uint b = t; b < 256; b += blockDim.x) {
+        args.histogram[b] = 0;
+    }
+}
+struct RadixSelectHistogramArgs {
+    in_plane values;
+    long n;
+    device const uint* state;
+    device atomic_uint* histogram;
+    int shift;
+};
+kernel void radix_select_histogram(constant RadixSelectHistogramArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    threadgroup atomic_uint block_hist[256];
     for (uint b = threadIdx.x; b < 256; b += blockDim.x) {
-        uint c = atomic_load_explicit(&h[b], memory_order_relaxed);
-        if (c) atomic_fetch_add_explicit(&P.hist[b], c, memory_order_relaxed);
+        atomic_store_explicit(&block_hist[b], 0u, memory_order_relaxed);
+    }
+    SYNC_THREADGROUP();
+    const int shift = args.shift;
+    uint prefix = args.state[0];
+    uint prefix_mask = shift >= 24 ? 0u : (0xffffffffu << (shift + 8));
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < args.n; i += (long)gridDim.x * blockDim.x) {
+        uint key = float_to_ordered_key(args.values[i]);
+        if ((key & prefix_mask) == (prefix & prefix_mask)) {
+            atomic_fetch_add_explicit(&block_hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+        }
+    }
+    SYNC_THREADGROUP();
+    for (uint b = threadIdx.x; b < 256; b += blockDim.x) {
+        uint c = atomic_load_explicit(&block_hist[b], memory_order_relaxed);
+        if (c) {
+            atomic_fetch_add_explicit(&args.histogram[b], c, memory_order_relaxed);
+        }
     }
 }
-struct SelScanArgs { device uint* st; device uint* hist; int shift; };
-kernel void sel_scan(constant SelScanArgs& P [[buffer(0)]], KARGS) {
-    if (threadIdx.x != 0) return;
-    uint k = P.st[1], c = 0;
+struct RadixSelectScanArgs {
+    device uint* state;
+    device uint* histogram;
+    int shift;
+};
+kernel void radix_select_scan(constant RadixSelectScanArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    uint rank = args.state[1];
+    uint below = 0;
     for (int b = 0; b < 256; b++) {
-        uint hb = P.hist[b];
-        if (c + hb > k) { P.st[0] |= ((uint)b << P.shift); P.st[1] = k - c; break; }
-        c += hb;
+        uint c = args.histogram[b];
+        if (below + c > rank) {
+            args.state[0] |= ((uint)b << args.shift);
+            args.state[1] = rank - below;
+            break;
+        }
+        below += c;
     }
-    for (int b = 0; b < 256; b++) P.hist[b] = 0;
+    for (int b = 0; b < 256; b++) {
+        args.histogram[b] = 0;
+    }
 }
-struct SelValueArgs { device const uint* st; fp out; };
-kernel void sel_value(constant SelValueArgs& P [[buffer(0)]], KARGS) {
-    if (threadIdx.x == 0) *P.out = fkey_inv(P.st[0]);
+struct RadixSelectValueArgs {
+    device const uint* state;
+    out_plane out;
+};
+kernel void radix_select_value(constant RadixSelectValueArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    if (threadIdx.x == 0) {
+        *args.out = ordered_key_to_float(args.state[0]);
+    }
 }
-// flowdegrain2 noise(): var = max((1.4826 med)^2, 0.001)
-struct NoiseArgs { cfp med; fp var; float mult; };
-kernel void noise_var(constant NoiseArgs& P [[buffer(0)]], KARGS) {
-    if (threadIdx.x == 0) { float t = 1.4826f * *P.med; *P.var = fmax(t * t, 0.001f) * P.mult; }
+// noise variance from the median absolute high-pass value: max((1.4826 median)^2, 0.001) * scale
+struct NoiseVarianceArgs {
+    in_plane median;
+    out_plane variance;
+    float scale;
+};
+kernel void noise_variance(constant NoiseVarianceArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    if (threadIdx.x == 0) {
+        float sigma = 1.4826f * *args.median;
+        *args.variance = fmax(sigma * sigma, 0.001f) * args.scale;
+    }
 }
-// cupy quantile, method 'linear', float32: lo, hi = sorted values at floor(idx), +1
-struct QuantArgs { cfp lo; cfp hi; float w; fp out; };
-kernel void quantile_finish(constant QuantArgs& P [[buffer(0)]], KARGS) {
-    if (threadIdx.x != 0) return;
-    float a = *P.lo, b = *P.hi, diff = b - a, w = P.w;
-    *P.out = w < 0.5f ? a + diff * w : b - diff * (1 - w);
+// linear-interpolation quantile from its two neighbouring order statistics (NumPy / CuPy's form)
+struct QuantileLerpArgs {
+    in_plane lo;
+    in_plane hi;
+    float w;
+    out_plane out;
+};
+kernel void quantile_lerp(constant QuantileLerpArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    float a = *args.lo;
+    float b = *args.hi;
+    float diff = b - a;
+    float w = args.w;
+    *args.out = w < 0.5f ? a + diff * w : b - diff * (1 - w);
 }
-
