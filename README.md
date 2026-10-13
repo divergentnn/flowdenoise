@@ -32,8 +32,8 @@ of [GRAILS](https://github.com/divergentnn/grail), a grain-aware video quality m
 
 | backend | feature | status |
 |---|---|---|
-| NVIDIA GPUs (CUDA 12+, sm_75 and newer; PTX for newer GPUs) | `cuda` (default) | bit-identical to the Python reference |
-| Apple GPUs (Metal, macOS) | `metal` (default; inert elsewhere) | same algorithm; not bit-exact with CUDA (another compiler, other fast-math functions) |
+| NVIDIA GPUs (CUDA 12+, sm_75 and newer; PTX for newer GPUs) | `cuda` (default) | tested (RTX 3090) |
+| Apple GPUs (Metal, macOS) | `metal` (default; inert elsewhere) | tested (M1 Max); tiny numeric differences from CUDA |
 | AMD GPUs (HIP / ROCm) | `hip` | the kernels compile with hipcc; not run yet |
 
 There is no CPU backend.
