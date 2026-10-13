@@ -3,7 +3,8 @@
 tools/msl_shim/metal_shim.h standing in for <metal_stdlib>) to LLVM IR, and every kernel's IR is compared with its
 counterpart (renamed kernels matched through compare_sass.py's RENAMED plus METAL_RENAMED).
 
-    tools/compare_msl_ir.py BEFORE_REV [AFTER_REV] [--files a.metal,b.metal] [--kdir DIR]
+    tools/compare_msl_ir.py BEFORE_REV [AFTER_REV] [--files a.metal,b.metal] [--kdir DIR] [--repo DIR]
+                            [--renames map.json]
 
 AFTER_REV defaults to the working tree. The Metal built-ins are opaque calls and no fast math is applied, so the IR
 records each kernel's own arithmetic in source order (FMA contraction points included): identical IR means the edit
@@ -12,6 +13,7 @@ Mac (the Metal compiler and its fast math are not modelled here). Needs clang++ 
 """
 import argparse
 import importlib.util
+import json
 import re
 import shutil
 import subprocess
@@ -85,7 +87,7 @@ def kernels_ir(text, work, tag):
         norm = []
         for line in funcs[mangled]:
             line = re.sub(r"%struct\.[\w.]+", "%struct.T", line)
-            line = re.sub(r",? !\w+ !\d+", "", line)
+            line = re.sub(r",? ![\w.]+ !\d+", "", line)
             line = re.sub(r" #\d+", "", line)
             line = line.replace("noundef ", "")             # return-value annotations of inlined helpers
             norm.append(line)
@@ -100,7 +102,12 @@ def main():
     ap.add_argument("--kdir", default="flowdenoise-core/kernels/metal")
     ap.add_argument("--files", default="flowdenoise.metal,flowdenoise_ops.metal")
     ap.add_argument("--repo", default=str(HERE.parent))
+    ap.add_argument("--renames", help='JSON {"renamed": {old: new}, "removed": [old, ...]} instead of the built-in map')
     a = ap.parse_args()
+    renamed, removed = RENAMED, REMOVED
+    if a.renames:
+        m = json.loads(Path(a.renames).read_text())
+        renamed, removed = m.get("renamed", {}), set(m.get("removed", []))
     if not shutil.which("clang++") or not shutil.which("llvm-cxxfilt"):
         sys.exit("needs clang++ and llvm-cxxfilt")
     repo = Path(a.repo)
@@ -113,9 +120,9 @@ def main():
             after = kernels_ir(source(repo, a.after, path), work, "after")
             seen = set()
             for old, code in sorted(before.items()):
-                if old in REMOVED:
+                if old in removed:
                     continue
-                new = RENAMED.get(old, old)
+                new = renamed.get(old, old)
                 seen.add(new)
                 if new not in after:
                     print(f"{f:24} {old:24} MISSING after ({new})")

@@ -3,15 +3,17 @@
 embedded PTX (the JIT input for newer GPUs) up to the names a rename changes.
 
     tools/compare_sass.py BEFORE_REV [AFTER_REV] [--arch 75,80,86,89,90,120] [--ptx-arch 120]
+    tools/compare_sass.py BEFORE_REV --repo OTHER_REPO --kdir kernels --units grail.cu:ieee --renames map.json
 
 AFTER_REV defaults to the working tree. Both revisions' kernels/*.cu are compiled to cubins with the build's flags
 (nvcc -O3 -std=c++17, --use_fast_math for flowdenoise.cu) and disassembled with cuobjdump; kernels renamed between
-the revisions are matched through RENAMED. Identical SASS for every kernel and architecture means the edit cannot
+the revisions are matched through RENAMED (or --renames FILE.json: {"renamed": {old: new}, "removed": [old]}). Identical SASS for every kernel and architecture means the edit cannot
 change any output on those GPUs, for any input (a stronger check than output hashes on test clips).
 
 Needs nvcc and cuobjdump on PATH (or CUDA_PATH).
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -67,14 +69,14 @@ def tool(name):
     return shutil.which(name) or name
 
 
-def checkout(repo, rev, dst):
-    """kernels of `rev` (None: the working tree) into dst"""
+def checkout(repo, rev, dst, kdir, files):
+    """kernel files of `rev` (None: the working tree) into dst"""
     dst.mkdir(parents=True)
-    for f in [*UNITS, "portable.h"]:
+    for f in files:
         if rev is None:
-            shutil.copy(repo / KDIR / f, dst / f)
+            shutil.copy(repo / kdir / f, dst / f)
         else:
-            data = subprocess.run(["git", "-C", str(repo), "show", f"{rev}:{KDIR}/{f}"], check=True,
+            data = subprocess.run(["git", "-C", str(repo), "show", f"{rev}:{kdir}/{f}"], check=True,
                                   capture_output=True).stdout
             (dst / f).write_bytes(data)
 
@@ -123,25 +125,37 @@ def main():
     ap.add_argument("after", nargs="?")
     ap.add_argument("--arch", default="75,80,86,89,90,120")
     ap.add_argument("--ptx-arch", default="120", help="also compare the embedded PTX for this compute capability")
+    ap.add_argument("--repo", default=str(Path(__file__).resolve().parents[1]))
+    ap.add_argument("--kdir", default=KDIR, help="kernel directory inside the repository")
+    ap.add_argument("--units", default=",".join(f"{u}:{'fast' if f else 'ieee'}" for u, f in UNITS.items()),
+                    help="compilation units with their math mode (fast = --use_fast_math)")
+    ap.add_argument("--headers", default="portable.h")
+    ap.add_argument("--renames", help='JSON {"renamed": {old: new}, "removed": [old, ...]} instead of the built-in map')
     a = ap.parse_args()
-    repo = Path(__file__).resolve().parents[1]
+    repo = Path(a.repo)
+    units = {u.split(":")[0]: u.split(":")[1] == "fast" for u in a.units.split(",")}
+    renamed, removed = RENAMED, REMOVED
+    if a.renames:
+        m = json.loads(Path(a.renames).read_text())
+        renamed, removed = m.get("renamed", {}), set(m.get("removed", []))
+    files = [*units, *[h for h in a.headers.split(",") if h]]
     bad = 0
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        checkout(repo, a.before, tmp / "before")
-        checkout(repo, a.after, tmp / "after")
+        checkout(repo, a.before, tmp / "before", a.kdir, files)
+        checkout(repo, a.after, tmp / "after", a.kdir, files)
         jobs = [(f"sm_{arch}", sass, arch) for arch in a.arch.split(",") if arch]
         jobs += [(f"ptx_{arch}", ptx, arch) for arch in a.ptx_arch.split(",") if arch]
         for label, compile_, arch in jobs:
-            for unit, fast in UNITS.items():
+            for unit, fast in units.items():
                 before = compile_(tmp / "before", unit, fast, arch, tmp / "before")
                 after = compile_(tmp / "after", unit, fast, arch, tmp / "after")
                 seen = set()
                 for old, code in sorted(before.items()):
-                    if old in REMOVED:
+                    if old in removed:
                         print(f"{label:7} {unit:20} {old:24} removed")
                         continue
-                    new = RENAMED.get(old, old)
+                    new = renamed.get(old, old)
                     seen.add(new)
                     if new not in after:
                         print(f"{label:7} {unit:20} {old:24} MISSING after ({new})")

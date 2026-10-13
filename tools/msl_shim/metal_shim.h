@@ -55,6 +55,23 @@ const int mem_threadgroup = 1;
 template <typename T, typename U>
 T as_type(U);
 
+// overloaded built-ins: opaque declarations (mangled per argument type)
+int min(int, int);
+int max(int, int);
+uint min(uint, uint);
+uint max(uint, uint);
+bool simd_any(bool);
+uint simd_min(uint);
+uint simd_max(uint);
+float simd_min(float);
+float simd_max(float);
+namespace precise {
+float msl_sqrt(float);  // precise::sqrt (the sqrt macro renames it)
+}
+namespace fast {
+float msl_sqrt(float);
+}
+
 struct atomic_uint {
     uint value;
 };
