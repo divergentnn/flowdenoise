@@ -97,7 +97,8 @@ def sass(src_dir, unit, fast, arch, out):
             name = m.group(1)
             funcs[name] = []
         elif name and line.strip():
-            funcs[name].append(line.strip())
+            # whitespace collapsed: cuobjdump pads the columns to the longest instruction in the whole file
+            funcs[name].append(" ".join(line.split()))
     return funcs
 
 
