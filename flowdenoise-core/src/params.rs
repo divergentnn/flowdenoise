@@ -9,7 +9,7 @@ use std::str::FromStr;
 /// Units: luma in 10-bit codes for the image arithmetic, but `thsad` is an MVTools-style SAD in 8-bit units over an
 /// 8x8 block (MVTools' thSAD); distances in pixels; the motion pyramid works on 8-bit luma.
 ///
-/// The fields after `fallback_radius` are `f64`: the reference computes with them in double precision (Gaussian taps,
+/// The floating-point fields after `fallback_radius` are `f64`: the reference computes with them in double precision (Gaussian taps,
 /// sums of two parameters) before rounding to float, and parses them as doubles.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Params {
@@ -64,6 +64,17 @@ pub struct Params {
     /// and neighbour, 1.4826 x the median |warped - current| over every 53rd pixel of mid luma (100 ... 900; all of
     /// them if fewer than 1000), at least 0.5
     pub range_sigma: f64,
+    /// persistence restore (0 = off): after the guided fallback, put back fine detail that persists at the same place
+    /// in the UNWARPED neighbours at least persist_gap frames away (static painted texture, held drawings; grain
+    /// decorrelates over that distance; with none that far, the farthest ones). The reference's --persist-gap G
+    /// --persist-static; its motion-compensated variant is not ported.
+    pub persist_gap: usize,
+    /// persistence restore: local correlation (median over the far neighbours) where the restore starts
+    pub persist_lo: f64,
+    /// persistence restore: correlation of a full restore
+    pub persist_hi: f64,
+    /// persistence restore: sigma of the Gaussian correlation window
+    pub persist_win: f64,
 }
 
 /// Named parameter sets.
@@ -140,6 +151,10 @@ impl Params {
             range_k: 0.0,
             range_soft: 1.5,
             range_sigma: 0.0,
+            persist_gap: 0,
+            persist_lo: 0.3,
+            persist_hi: 0.6,
+            persist_win: 2.0,
         }
     }
 
@@ -185,7 +200,8 @@ impl Params {
             && self.fb_win > 0.0
             && self.range_k >= 0.0
             && self.range_soft > 0.0
-            && self.range_sigma >= 0.0;
+            && self.range_sigma >= 0.0
+            && self.persist_win > 0.0;
         if !ok {
             bail!("invalid denoiser parameters: {self:?}");
         }
@@ -233,7 +249,7 @@ mod tests {
         assert_eq!((c.radius, c.fallback, c.fallback_radius, c.fb_gate), (8, 1000.0, 5, 3.0));
         assert_eq!(Params { fb_gate: 0.0, radius: 3, fallback: 4.0, fallback_radius: 3, ..c }, Params::production());
         // off by default in every preset
-        assert!(Preset::ALL.iter().all(|&p| Params::preset(p).range_k == 0.0));
+        assert!(Preset::ALL.iter().all(|&p| Params::preset(p).range_k == 0.0 && Params::preset(p).persist_gap == 0));
         assert!(Params { range_soft: 0.0, ..Params::cel() }.validate().is_err());
     }
 }

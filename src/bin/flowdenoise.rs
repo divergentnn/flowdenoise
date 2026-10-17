@@ -100,6 +100,19 @@ struct Cli {
     /// the median |warped - current| over mid-luma pixels
     #[arg(long, value_name = "S", help_heading = "Parameters (default: the preset's)")]
     range_sigma: Option<f64>,
+    /// persistence restore: put back fine detail that persists at the same place in the unwarped neighbours >= G
+    /// frames away (static painted texture; the reference's --persist-gap G --persist-static); 0 = off
+    #[arg(long, value_name = "G", help_heading = "Parameters (default: the preset's)")]
+    persist_gap: Option<usize>,
+    /// persistence restore: correlation where the restore starts
+    #[arg(long, help_heading = "Parameters (default: the preset's)")]
+    persist_lo: Option<f64>,
+    /// persistence restore: correlation of a full restore
+    #[arg(long, help_heading = "Parameters (default: the preset's)")]
+    persist_hi: Option<f64>,
+    /// persistence restore: Gaussian sigma of the correlation window
+    #[arg(long, help_heading = "Parameters (default: the preset's)")]
+    persist_win: Option<f64>,
 }
 
 impl Cli {
@@ -109,7 +122,8 @@ impl Cli {
             ($($f:ident),*) => { $(if let Some(v) = self.$f { p.$f = v; })* };
         }
         set!(radius, thsad, flow_scale, levels, finest, iterations, detail_gate, detail_boost, spike, fast_th, fallback,
-             fallback_eps, fallback_radius, fb_gate, fb_q, fb_sg, fb_win, range_k, range_soft, range_sigma);
+             fallback_eps, fallback_radius, fb_gate, fb_q, fb_sg, fb_win, range_k, range_soft, range_sigma, persist_gap,
+             persist_lo, persist_hi, persist_win);
         if self.no_round_motion {
             p.round_motion = false;
         }

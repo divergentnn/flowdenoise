@@ -31,7 +31,9 @@
 //! The presets ([`Preset`]): `production` (the encode pipeline's denoiser), `measure` (GRAIL's pinned measurement
 //! settings: the same without the detail boost) and `cel` (2D cel animation: radius 8, the guided fallback everywhere,
 //! gated by stability). The range check ([`Params::range_k`], off in every preset) keeps faint drawn strokes, rain and
-//! sprites that a 1-pixel misalignment of a neighbour would average away.
+//! sprites that a 1-pixel misalignment of a neighbour would average away; the persistence restore
+//! ([`Params::persist_gap`], off in every preset) puts back static painted texture that persists in the unwarped
+//! neighbours several frames away.
 use anyhow::{bail, ensure, Result};
 
 pub use flowdenoise_core::{compiled_backends, Backend, Denoise, Params, Preset};

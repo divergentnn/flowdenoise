@@ -309,6 +309,104 @@ kernel void range_check(constant RangeCheckArgs& args [[buffer(0)]], KERNEL_INDI
     args.weight[i] *= saturate_unit((t1 - args.abs_diff[i]) / fmax(t1 - t0, 1e-6f));
 }
 
+// ------------------------------------------------------------------------------------------------ persistence restore
+// (flowdenoise_ops.cu has the description)
+
+// a * b
+struct MultiplyArgs {
+    in_plane a;
+    in_plane b;
+    out_plane out;
+    long count;
+};
+kernel void multiply(constant MultiplyArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.out[i] = args.a[i] * args.b[i];
+}
+// rho = cross / (sqrt(current_energy own_energy) + 0.001)
+struct PersistCorrelationArgs {
+    in_plane cross;
+    in_plane own_energy;
+    in_plane current_energy;
+    out_plane rho;
+    long count;
+};
+kernel void persist_correlation(constant PersistCorrelationArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.rho[i] = args.cross[i] / (sqrt(args.current_energy[i] * args.own_energy[i]) + 1e-3f);
+}
+// g = clamp((rho - lo) / span), rho = the median of the planes' values (3 or more), else their mean
+struct PersistGainArgs {
+    in_plane rhos;
+    int planes;
+    long plane_size;
+    float lo, span;
+    out_plane gain;
+    long count;
+};
+kernel void persist_gain(constant PersistGainArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    const int planes = args.planes;
+    const uint plane_size = (uint)args.plane_size;
+    float rho;
+    if (planes >= 3) {
+        float v[16];
+        for (int j = 0; j < planes; j++) {
+            float x = args.rhos[j * plane_size + i];
+            int k = j;
+            for (; k > 0 && v[k - 1] > x; k--) {
+                v[k] = v[k - 1];
+            }
+            v[k] = x;
+        }
+        int mid = planes / 2;
+        rho = planes % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+    } else {
+        float sum = 0.f;
+        for (int j = 0; j < planes; j++) {
+            sum += args.rhos[j * plane_size + i];
+        }
+        rho = sum / planes;
+    }
+    args.gain[i] = saturate_unit((rho - args.lo) / args.span);
+}
+// sum = (first ? 0 : sum) + high
+struct PersistAccumulateArgs {
+    out_plane sum;
+    in_plane high;
+    int first;
+    long count;
+};
+kernel void persist_accumulate(constant PersistAccumulateArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    float s = args.first ? 0.f : args.sum[i];
+    args.sum[i] = s + args.high[i];
+}
+// out = x + g (t - (x - x_low)), t = (current_high + far_high_sum) / (1 + far_count), g = gain[i % g_period]
+struct PersistApplyArgs {
+    in_plane x;
+    in_plane x_low;
+    in_plane current_high;
+    in_plane far_high_sum;
+    float count_plus_one;
+    in_plane gain;
+    long g_period;
+    out_plane out;
+    long count;
+};
+kernel void persist_apply(constant PersistApplyArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    float v = args.x[i];
+    float t = (args.current_high[i] + args.far_high_sum[i]) / args.count_plus_one;
+    float d = t - (v - args.x_low[i]);
+    args.out[i] = v + args.gain[i % (uint)args.g_period] * d;
+}
+
 // ------------------------------------------------------------------------------------------------ detail gate, output
 
 // detail gate and output luma (flowdenoise_ops.cu, detail_gate_luma)

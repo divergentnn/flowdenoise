@@ -28,6 +28,8 @@ of [GRAILS](https://github.com/divergentnn/grail), a grain-aware video quality m
   animation with grainy cels: 16 neighbours, the guided fallback everywhere, gated by stability).
 - **Range check** (opt-in) - per pixel, a neighbour that disagrees with the current frame by more than a few noise
   sigmas loses its weight, so faint drawn strokes, rain and sprites survive a 1-pixel misalignment.
+- **Persistence restore** (opt-in) - fine detail that stays at the same place in the unwarped neighbours several
+  frames away (static painted texture) is put back after the fallback; grain decorrelates over that distance.
 - **Library and binary** - a Rust library (frames in, denoised frames out, lookahead handled internally) and a
   y4m command-line tool behind the `binary` feature.
 - **10-bit 4:2:0** - frames are processed as 10-bit planes; 8-bit sources convert losslessly.
@@ -37,7 +39,7 @@ of [GRAILS](https://github.com/divergentnn/grail), a grain-aware video quality m
 | backend | feature | status |
 |---|---|---|
 | NVIDIA GPUs (CUDA 12+, sm_75 and newer; PTX for newer GPUs) | `cuda` (default) | tested (RTX 3090) |
-| Apple GPUs (Metal, macOS) | `metal` (default; inert elsewhere) | tested (M1 Max); tiny numeric differences from CUDA. The `cel` preset (radius 8), its stability gate and the range check are compile-checked only on Metal: not run yet |
+| Apple GPUs (Metal, macOS) | `metal` (default; inert elsewhere) | tested (M1 Max); tiny numeric differences from CUDA. The `cel` preset (radius 8), its stability gate, the range check and the persistence restore are compile-checked only on Metal: not run yet |
 | AMD GPUs (HIP / ROCm) | `hip` | the kernels compile with hipcc; not run yet |
 
 There is no CPU backend.
@@ -77,11 +79,14 @@ flowdenoise [OPTIONS] <INPUT> <OUTPUT>
   parameters (default: the preset's): --radius --thsad --flow-scale --levels --finest --iterations
       --no-round-motion --detail-gate --detail-boost --spike --fast-th --fallback --fallback-eps --fallback-radius
       --fb-gate --fb-q --fb-sg --fb-win --range-k --range-soft --range-sigma
+      --persist-gap --persist-lo --persist-hi --persist-win
 ```
 
 ```sh
 # 2D cel animation; the range check on, sigma estimated per frame and neighbour
 flowdenoise --preset cel --range-k 2 in.y4m out.y4m
+# ... and static painted texture restored from the neighbours 6 or more frames away
+flowdenoise --preset cel --range-k 2 --persist-gap 6 in.y4m out.y4m
 ```
 
 The input must be 10-bit 4:2:0 y4m (`C420p10`). The output header is the input's, byte for byte; frame parameters on
@@ -106,6 +111,8 @@ The input must be 10-bit 4:2:0 y4m (`C420p10`). The output header is the input's
 | `range-k` | 0 | 0 | 0 | range check (0 = off): a neighbour pixel keeps its weight up to `range-k` sigma_d of difference from the current frame |
 | `range-soft` | 1.5 | 1.5 | 1.5 | range check: the weight falls to 0 over this many more sigma_d |
 | `range-sigma` | 0 | 0 | 0 | range check: the source's pixel noise in 10-bit codes (sigma_d = sqrt(2) x it); 0 = estimated per frame and neighbour |
+| `persist-gap` | 0 | 0 | 0 | persistence restore (0 = off): detail is tested against the unwarped neighbours at least this many frames away |
+| `persist-lo`, `persist-hi`, `persist-win` | 0.3, 0.6, 2 | 0.3, 0.6, 2 | 0.3, 0.6, 2 | persistence restore: correlation where the restore starts and where it is full; Gaussian sigma of the correlation window |
 | `detail-gate` | 0.6 | 0.6 | 0.6 | coherence above which the current frame's detail is restored |
 | `detail-boost` | **1.3** | **1** | 1.3 | gain of the restored detail |
 
@@ -132,6 +139,21 @@ difference of two noisy samples: sqrt(2) x `--range-sigma` (the source's noise, 
 fewer than 1000), at least 0.5, per frame and neighbour. The estimate runs on the GPU (a counted gather and the radix
 select); there is no host round trip. Flat areas dominate cel frames, so the median reads the noise, not the
 misaligned lines.
+
+### Persistence restore
+
+`--persist-gap G` (off by default in every preset) brings back fine static texture, such as speckle painted on a
+background, that the fusion and the guided fallback flatten together with the grain when the two have about the same
+amplitude. Grain decorrelates within a few frames, a painted background does not: the restore uses the **unwarped**
+neighbours at least G frames away (texture that stays at the same place is aligned exactly without motion
+compensation; with no neighbour that far, the farthest ones). Per pixel, with hc the current frame's high-pass
+x - G(x, 1) and hn_j each far neighbour's: rho_j = G(hc hn_j) / (sqrt(G(hc^2) G(hn_j^2)) + 0.001) (Gaussian window,
+sigma `persist-win`), rho = their median (the mean below 3 of them), g = clamp((rho - lo) / (hi - lo), 0, 1), and the
+output's high-pass is replaced by g x the mean of hc and the hn_j: out = x + g (t - (x - G(x, 1))). Chroma uses the 2x2
+mean of g and the chroma high-passes. It runs after the guided fallback, before the detail gate. This is the
+reference's `--persist-gap G --persist-static`; its motion-compensated variant (without `--persist-static`) is not
+ported. G should exceed how long the source holds its grain together with the drawings (6 for a source that repeats
+each drawing for 2 or 3 frames).
 
 ## Library
 
@@ -170,7 +192,10 @@ with its default arguments, `measure` equals it with `--detail-boost 1` and equa
 clips (1920x804 and 1920x1080, 24 frames each) `cel`, `cel --range-k 2` and `cel --range-k 2 --range-sigma 2` equal
 the reference's `--preset cel` with the same options; so do `cel --range-k 2` on a dark clip (no mid-luma pixels: the
 estimate's fallback to all samples) and `production --range-k 2`. `--range-k 0` is the same as no range check, byte
-for byte.
+for byte. `cel --range-k 2 --persist-gap 6` equals the reference's `--persist-gap 6 --persist-static` on those two clips
+and a 1920x1036 one (24 frames), and so do `cel --range-k 2 --persist-gap 7` on 10 frames (the mean of 1 or 2
+correlations and the farthest-neighbour fallback) and `production --persist-gap 6`; `--persist-gap 0` is the same as
+no restore, byte for byte.
 
 `flowdenoise-core/kernels/README.md` explains the numerical rules that keep it that way and the tools that check a
 kernel edit (identical SASS and PTX per kernel; output hashes before and after).
@@ -189,8 +214,10 @@ On an RTX 3090 shared with other jobs, the CLI runs about as fast as the Python 
 
 The library loop with the frames in memory (upload, GPU work and download, one frame at a time), per frame on the
 same GPU: at 1920x1080 `production` 9.5 ... 10 ms, `cel` 19.5 ... 20 ms, `cel --range-k 2` 20.7 ms (the estimated
-sigma: about 1.1 ms for 16 neighbours), with `--range-sigma` 19.8 ms; at 1920x804 7.6, 14.8, 16.0 and 15.1 ms. The GPU waits while a frame
-is copied in and out; overlapping those copies with the next frame's work is on the roadmap.
+sigma: about 1.1 ms for 16 neighbours), with `--range-sigma` 19.8 ms; at 1920x804 7.6, 14.8, 16.0 and 15.1 ms. At
+1920x1036 `cel --range-k 2` takes 19.5 ms and `--persist-gap 6` adds 3.7 ms (six far neighbours; the reference: 19.3
+and 33.1 ms). The GPU waits while a frame is copied in and out; overlapping those copies with the next frame's work
+is on the roadmap.
 
 ## Algorithms and acknowledgements
 

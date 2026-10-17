@@ -3,7 +3,7 @@
 | file | compiled | contents |
 |---|---|---|
 | `flowdenoise.cu` | nvcc **with** `--use_fast_math` | separable filters, motion pyramid, motion search, flow densification, Lanczos-3 warps, temporal weights, fusion |
-| `flowdenoise_ops.cu` | nvcc **without** fast math | conversions, elementwise steps of the guided fallback (and its stability gate), the range check and the detail gate, output packing, radix select |
+| `flowdenoise_ops.cu` | nvcc **without** fast math | conversions, elementwise steps of the guided fallback (and its stability gate), the range check, the persistence restore and the detail gate, output packing, radix select |
 | `portable.h` | | the HIP shim (warp shuffle) |
 | `metal/flowdenoise.metal` | Metal, fast math | MSL port of `flowdenoise.cu` |
 | `metal/flowdenoise_ops.metal` | Metal, no fast math | MSL port of `flowdenoise_ops.cu`, plus the Metal driver's copy / fill kernels |
@@ -64,6 +64,15 @@ frame t
          downsample_2x2, scale_by_complement   chroma factor *= 1 - down(s)
        guided filter                  box mean of x and x^2 (separable_filter_7 / _3), guided_coefficients, box means
                                       of the coefficients, guided_blend; chroma at half size
+  4b. persistence restore [persist_gap > 0]: the unwarped far neighbours (|d| >= gap, else the farthest)
+       square, separable_filter_any (13)          G(hc^2), hc = the current Y's high-pass (sigma-1 residual)
+       per far neighbour: separable_filter_7, subtract   hn = its Y - G(Y, 1)
+                          multiply / square, separable_filter_any (13) x 2, persist_correlation   rho_j
+                          persist_accumulate      sum of the hn, in order from 0
+       persist_gain                   median (mean below 3) of the rho_j -> gain g
+       separable_filter_7, persist_apply           Y += g ((hc + sum) / (1 + n) - (Y - G(Y, 1)))
+       downsample_2x2(g); the same with the chroma high-passes (separable_filter_7 on 2 planes, subtract,
+       persist_accumulate, persist_apply)
   5. detail gate and output
        separable_filter_7, squared_diff, separable_filter_19   local detail energy of the fused Y (sigma 1, sigma 3)
        gather_strided, radix select x 2, quantile_lerp         its 25th percentile (every 97th sample): flat level
@@ -76,7 +85,8 @@ The tap counts of the separable filters: 3 (chroma guided-filter box, radius 1),
 chroma box, radius 2), 7 (Gaussian sigma 1, luma guided-filter box radius 3, motion pre-blur), 8 (SAD box), 19
 (Gaussian sigma 3, also the stability gate's window), 37 (Gaussian sigma 6). Other tap counts use
 `separable_filter_any`, as the reference uses its generic `sep` kernel for them: in the cel preset the luma box of
-radius 5 (11 taps) and the stability gate's Gaussian sigma 2 (13 taps).
+radius 5 (11 taps), the stability gate's Gaussian sigma 2 (13 taps) and the persistence restore's window (sigma 2,
+13 taps).
 
 Algorithms with a reference: the motion search follows DIS (Kroeger, Timofte, Dai, Van Gool, *Fast Optical Flow using
 Dense Inverse Search*, ECCV 2016): inverse-compositional patch search on a pyramid, mean-normalised SSD, spatial
@@ -100,7 +110,9 @@ The CUDA output is bit-identical to the Python reference (CuPy). That holds only
    neighbours in the order t - r, ..., t - 1, t + 1, ..., t + r (luma in `fuse_frames`, chroma in launch order).
 4. **Expression structure matters.** nvcc contracts `a * b + c` into one FMA within an expression (`--fmad=true`,
    the default). Splitting an expression into several statements, merging statements, or hoisting a subexpression can
-   change where FMAs form, and with them the rounding.
+   change where FMAs form, and with them the rounding. Where a kernel fuses steps that the reference runs as separate
+   CuPy operations (one rounding each), a multiplication that feeds an addition is written `__fmul_rn` so that it
+   is not contracted (`persist_apply`).
 5. **Rounding**: `rintf` and `__float2int_rn` round half to even, as NumPy / CuPy's `rint`. The median is the lower
    middle element (k = (n - 1) / 2), the quantile is NumPy's linear interpolation in its `lerp` form.
 6. **Determinism**: no floating-point atomics anywhere (the only atomics count integers: the radix select's

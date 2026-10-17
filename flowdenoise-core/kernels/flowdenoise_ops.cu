@@ -1,6 +1,6 @@
 // flowdenoise_ops.cu: elementwise and order-statistic kernels of the denoiser (format conversions, the guided
-// fallback and its stability gate, the range check, the detail gate, output packing, a radix select for medians and
-// quantiles).
+// fallback and its stability gate, the range check, the persistence restore, the detail gate, output packing, a radix
+// select for medians and quantiles).
 //
 // Compiled WITHOUT fast math: these are the Python reference's CuPy elementwise operations, which CuPy compiles
 // without it (IEEE division and square root). Do not move them into flowdenoise.cu. As there, every operation and
@@ -193,6 +193,79 @@ extern "C" __global__ void range_check(const float* abs_diff, const float* thres
     float t0 = thresholds[0];
     float t1 = thresholds[1];
     weight[i] *= saturate((t1 - abs_diff[i]) / fmaxf(t1 - t0, 1e-6f));
+}
+
+// ------------------------------------------------------------------------------------------------ persistence restore
+// --persist-gap: fine detail that persists at the same place in the UNWARPED neighbours at least `gap` frames away
+// (static painted texture) is put back after the guided fallback; grain decorrelates over that distance. Per far
+// neighbour j: rho_j = G(hc hn_j) / (sqrt(G(hc^2) G(hn_j^2)) + 0.001) (hc, hn_j: the current frame's and the
+// neighbour's high-pass x - G(x, 1); G: Gaussian, sigma persist_win); rho = median over j (mean below 3 of them);
+// g = clamp((rho - lo) / (hi - lo)); the output's high-pass is replaced by g x the mean of hc and the hn_j.
+
+// a * b.
+extern "C" __global__ void multiply(const float* a, const float* b, float* out, int64_t count) {
+    ELEMENT_INDEX
+    out[i] = a[i] * b[i];
+}
+
+// persist_correlation: rho = cross / (sqrt(current_energy * own_energy) + 0.001), the local correlation of the
+// current frame's high-pass with one far neighbour's (cross = G(hc hn), current_energy = G(hc^2), own_energy =
+// G(hn^2)). Output: one plane of the rho stack.
+extern "C" __global__ void persist_correlation(const float* cross, const float* own_energy, const float* current_energy,
+                                               float* rho, int64_t count) {
+    ELEMENT_INDEX
+    rho[i] = cross[i] / (sqrtf(current_energy[i] * own_energy[i]) + 1e-3f);
+}
+
+// persist_gain: g = clamp((rho - lo) / span, 0, 1) with rho over the `planes` correlations rho_j (planes of
+// plane_size, the far neighbours in order): their median (cupy.median: the middle value, or the mean (a + b) / 2 of
+// the two middle values) from 3 of them on, else their mean, summed from 0 in order and divided by the count.
+// span = max(hi - lo, 0.001). At most 16 planes. Output: g, one luma plane.
+extern "C" __global__ void persist_gain(const float* rhos, int planes, int64_t plane_size, float lo, float span,
+                                        float* gain, int64_t count) {
+    ELEMENT_INDEX
+    float rho;
+    if (planes >= 3) {
+        float v[16];
+        for (int j = 0; j < planes; j++) {  // insertion sort: the order statistics, whatever the sort
+            float x = rhos[j * plane_size + i];
+            int k = j;
+            for (; k > 0 && v[k - 1] > x; k--) {
+                v[k] = v[k - 1];
+            }
+            v[k] = x;
+        }
+        int mid = planes / 2;
+        rho = planes % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+    } else {
+        float sum = 0.f;
+        for (int j = 0; j < planes; j++) {
+            sum += rhos[j * plane_size + i];
+        }
+        rho = sum / planes;
+    }
+    gain[i] = saturate((rho - lo) / span);
+}
+
+// persist_accumulate: sum = (first ? 0 : sum) + high, the far neighbours' high-passes summed in order from 0 (as the
+// reference's Python sum).
+extern "C" __global__ void persist_accumulate(float* sum, const float* high, int first, int64_t count) {
+    ELEMENT_INDEX
+    float s = first ? 0.f : sum[i];
+    sum[i] = s + high[i];
+}
+
+// persist_apply: out = x + g * (t - (x - x_low)), t = (current_high + far_high_sum) / (1 + far_count): the output's
+// high-pass x - x_low (x_low = G(x, 1)) replaced by the mean high-pass t, weighted by g (g[i % g_period]: the luma
+// gain, or its 2x2 mean for both chroma planes). One rounding per operation, as the reference's CuPy steps (no FMA).
+extern "C" __global__ void persist_apply(const float* x, const float* x_low, const float* current_high,
+                                         const float* far_high_sum, float count_plus_one, const float* gain,
+                                         int64_t g_period, float* out, int64_t count) {
+    ELEMENT_INDEX
+    float v = x[i];
+    float t = (current_high[i] + far_high_sum[i]) / count_plus_one;
+    float d = t - (v - x_low[i]);
+    out[i] = v + __fmul_rn(gain[i % g_period], d);
 }
 
 // ------------------------------------------------------------------------------------------------ detail gate, output

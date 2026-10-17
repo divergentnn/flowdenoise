@@ -83,6 +83,9 @@ impl Engine {
             add("g_fb_sg", gauss_taps(p.fb_sg))?;
             add("g_fb_win", gauss_taps(p.fb_win))?;
         }
+        if p.persist_gap > 0 {
+            add("g_persist", gauss_taps(p.persist_win))?;
+        }
         let mut pool = HashMap::new();
         if p.range_k > 0.0 && p.range_sigma > 0.0 {
             pool.insert("range_fixed", DBuf::upload(&range_fixed_thresholds(&p))?);
@@ -247,6 +250,72 @@ impl Engine {
         Ok(t)
     }
 
+    /// flowdegrain2 persist() with --persist-static: the fine detail that persists at the same place in the unwarped
+    /// far neighbours (|d| >= persist_gap; with none, those at the largest |d|) put back into the fused luma oy and
+    /// chroma oc (after the guided fallback) -> the returned (luma, chroma) buffers
+    fn persist(&mut self, oy: u64, oc: u64, hc: u64, cur: &Ingested, nbrs: &[(i32, &Ingested)]) -> Result<(u64, u64)> {
+        let (w, h) = (self.w, self.h);
+        let (n, w2, h2) = (w * h, w / 2, h / 2);
+        let nc = w2 * h2;
+        let gap = self.p.persist_gap as i32;
+        let mut far: Vec<usize> = (0..nbrs.len()).filter(|&j| nbrs[j].0.abs() >= gap).collect();
+        if far.is_empty() {
+            let m = nbrs.iter().map(|x| x.0.abs()).max().unwrap_or(0);
+            far = (0..nbrs.len()).filter(|&j| nbrs[j].0.abs() == m).collect();
+        }
+        let nf = far.len();
+        let np1 = (1 + nf) as f32;
+        // luma: ecc = G(hc^2); per far neighbour hn = y_j - G(y_j, 1), rho_j, and the sum of the hn in order
+        let sq = self.buf("ps_sq", n * 4)?;
+        launch_n("square", n, args![hc, sq, n as i64])?;
+        let ecc = self.buf("ps_ecc", n * 4)?;
+        self.filt(sq, ecc, w, h, 1, "g_persist", false, false)?;
+        let rhos = self.buf("ps_rhos", nf * n * 4)?;
+        let low = self.buf("ps_low", n * 4)?;
+        let hn = self.buf("ps_hn", n * 4)?;
+        let prod = self.buf("ps_prod", n * 4)?;
+        let cross = self.buf("ps_cross", n * 4)?;
+        let own = self.buf("ps_own", n * 4)?;
+        let sum = self.buf("ps_sum", n * 4)?;
+        for (k, &j) in far.iter().enumerate() {
+            let yj = nbrs[j].1.y();
+            self.filt(yj, low, w, h, 1, "g1", false, false)?;
+            launch_n("subtract", n, args![yj, low, hn, n as i64])?;
+            launch_n("multiply", n, args![hc, hn, prod, n as i64])?;
+            self.filt(prod, cross, w, h, 1, "g_persist", false, false)?;
+            launch_n("square", n, args![hn, prod, n as i64])?;
+            self.filt(prod, own, w, h, 1, "g_persist", false, false)?;
+            launch_n("persist_correlation", n, args![cross, own, ecc, rhos + (k * n * 4) as u64, n as i64])?;
+            launch_n("persist_accumulate", n, args![sum, hn, (k == 0) as i32, n as i64])?;
+        }
+        let gain = self.buf("ps_gain", n * 4)?;
+        let (lo, span) = (self.p.persist_lo as f32, (self.p.persist_hi - self.p.persist_lo).max(1e-3) as f32);
+        launch_n("persist_gain", n, args![rhos, nf as i32, n as i64, lo, span, gain, n as i64])?;
+        let oy_low = self.buf("ps_oy_low", n * 4)?;
+        self.filt(oy, oy_low, w, h, 1, "g1", false, false)?;
+        let oy3 = self.buf("ps_oy", n * 4)?;
+        launch_n("persist_apply", n, args![oy, oy_low, hc, sum, np1, gain, n as i64, oy3, n as i64])?;
+        // chroma: the gain's 2x2 mean, the unwarped neighbours' chroma high-pass
+        let gain_c = self.buf("ps_gain_c", nc * 4)?;
+        self.down(gain, gain_c, w, h)?;
+        let low_c = self.buf("ps_low_c", 2 * nc * 4)?;
+        let hcc = self.buf("ps_hcc", 2 * nc * 4)?;
+        self.filt(cur.c(), low_c, w2, h2, 2, "g1", false, false)?;
+        launch_n("subtract", 2 * nc, args![cur.c(), low_c, hcc, (2 * nc) as i64])?;
+        let hn_c = self.buf("ps_hn_c", 2 * nc * 4)?;
+        let sum_c = self.buf("ps_sum_c", 2 * nc * 4)?;
+        for (k, &j) in far.iter().enumerate() {
+            let cj = nbrs[j].1.c();
+            self.filt(cj, low_c, w2, h2, 2, "g1", false, false)?;
+            launch_n("subtract", 2 * nc, args![cj, low_c, hn_c, (2 * nc) as i64])?;
+            launch_n("persist_accumulate", 2 * nc, args![sum_c, hn_c, (k == 0) as i32, (2 * nc) as i64])?;
+        }
+        self.filt(oc, low_c, w2, h2, 2, "g1", false, false)?;
+        let oc3 = self.buf("ps_oc", 2 * nc * 4)?;
+        launch_n("persist_apply", 2 * nc, args![oc, low_c, hcc, sum_c, np1, gain_c, nc as i64, oc3, (2 * nc) as i64])?;
+        Ok((oy3, oc3))
+    }
+
     /// flowdegrain2 fallback(): guided filter blend of x (planes x n) with alpha (broadcast modulo am)
     #[allow(clippy::too_many_arguments)]
     fn fallback(&mut self, x: u64, out: u64, alpha: u64, am: usize, eps: u64, w: usize, h: usize, planes: usize,
@@ -372,6 +441,8 @@ impl Engine {
         } else {
             (oy, oc)
         };
+        // persistence restore (the reference's --persist-gap G --persist-static), on the frames that have neighbours
+        let (oy2, oc2) = if p.persist_gap > 0 && d > 0 { self.persist(oy2, oc2, hc, cur, nbrs)? } else { (oy2, oc2) };
         // detail gate
         let low = self.buf("f_low", n * 4)?;
         self.filt(oy2, low, w, h, 1, "g1", false, false)?;

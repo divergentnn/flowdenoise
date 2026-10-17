@@ -6,6 +6,7 @@
 //!   FLOWDENOISE_TEST_EXPECT_CEL=out.y4m            its output with --preset cel
 //!   FLOWDENOISE_TEST_EXPECT_CEL_RANGE=out.y4m      --preset cel --range-k 2 (sigma_d estimated per neighbour)
 //!   FLOWDENOISE_TEST_EXPECT_CEL_RANGE_SIGMA=out.y4m  --preset cel --range-k 2 --range-sigma 2
+//!   FLOWDENOISE_TEST_EXPECT_CEL_PERSIST=out.y4m    --preset cel --range-k 2 --persist-gap 6 --persist-static
 //!
 //! Each expected file is compared frame by frame, every sample, through the library API.
 use flowdenoise::{Backend, Denoiser, Frame, Params, Preset};
@@ -99,4 +100,10 @@ fn cel_range_check_matches_reference() {
 #[test]
 fn cel_range_check_fixed_sigma_matches_reference() {
     check_params(&cel_range(2.0), "cel --range-k 2 --range-sigma 2", "FLOWDENOISE_TEST_EXPECT_CEL_RANGE_SIGMA");
+}
+
+#[test]
+fn cel_persistence_restore_matches_reference() {
+    let p = Params { persist_gap: 6, ..cel_range(0.0) };
+    check_params(&p, "cel --range-k 2 --persist-gap 6", "FLOWDENOISE_TEST_EXPECT_CEL_PERSIST");
 }
