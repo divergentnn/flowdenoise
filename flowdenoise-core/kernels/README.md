@@ -3,7 +3,7 @@
 | file | compiled | contents |
 |---|---|---|
 | `flowdenoise.cu` | nvcc **with** `--use_fast_math` | separable filters, motion pyramid, motion search, flow densification, Lanczos-3 warps, temporal weights, fusion |
-| `flowdenoise_ops.cu` | nvcc **without** fast math | conversions, elementwise steps of the guided fallback and the detail gate, output packing, radix select |
+| `flowdenoise_ops.cu` | nvcc **without** fast math | conversions, elementwise steps of the guided fallback (and its stability gate), the range check and the detail gate, output packing, radix select |
 | `portable.h` | | the HIP shim (warp shuffle) |
 | `metal/flowdenoise.metal` | Metal, fast math | MSL port of `flowdenoise.cu` |
 | `metal/flowdenoise_ops.metal` | Metal, no fast math | MSL port of `flowdenoise_ops.cu`, plus the Metal driver's copy / fill kernels |
@@ -14,7 +14,8 @@ comment with what it computes, its inputs and outputs (layout, units), its threa
 ## How the stages fit together
 
 Frames are 10-bit 4:2:0. Every input frame is prepared once (*ingest*); every output frame t is then made from frame t
-and its neighbours t - r ... t + r (r = 3: six neighbours, fewer at the ends of the stream).
+and its neighbours t - r ... t + r (r = 3: six neighbours; the cel preset r = 8: sixteen; fewer at the ends of the
+stream).
 
 ```
 ingest (once per input frame)
@@ -37,6 +38,14 @@ frame t
        separable_filter_37            Gaussian sigma 6 of |warped - Y| (spike reference)
        separable_filter_7             Gaussian sigma 1 of warped Y (its fine detail = warped - this)
        temporal_weight                MVTools DegrainWeight x spike rejection; warped fine detail
+       [range check, range_k > 0]     the weight falls from 1 to 0 as |warped - Y| goes from k to k + soft sigma_d:
+         memset, range_sample_gather    every 53rd |warped - Y| where Y is mid luma (100 ... 900), appended
+         range_sample_fallback          all of them if fewer than 1000
+         radix_select_init_median, radix_select_histogram_counted + radix_select_scan x 4, radix_select_value
+                                        their median, n counted on the device
+         range_thresholds               sigma_d = max(1.4826 median, 0.5); k sigma_d, (k + soft) sigma_d
+                                        (a fixed range_sigma: these two uploaded once, the four steps above skipped)
+         range_check                    weight *= clamp((t1 - |warped - Y|) / (t1 - t0))
        warp_accumulate_chroma         chroma warped with the 2x2-averaged flow, weighted, summed
   3. fusion
        fuse_frames                    luma sums: weighted, weights, squared weights, detail (signed, absolute)
@@ -45,8 +54,16 @@ frame t
        fallback_alpha                 blend factor
        noise variance per plane       gather_strided (every 53rd |high-pass| sample), radix select (median),
                                       noise_variance
+       downsample_2x2                 the chroma blend factor (from the ungated luma factor)
+       [stability gate, fb_gate > 0]  where the fused Y keeps structure above what the averaged grain would leave:
+         noise_variance                 the luma noise variance without the fallback_eps scale
+         separable_filter_any (13), subtract, square, separable_filter_19
+                                        energy of the high-pass Y - G(Y, 2), window G(., 3)
+         stability_share                s = clamp((energy / (var fb_q sq / ws^2) - 1) / (fb_gate - 1))
+         scale_by_complement            luma factor *= 1 - s
+         downsample_2x2, scale_by_complement   chroma factor *= 1 - down(s)
        guided filter                  box mean of x and x^2 (separable_filter_7 / _3), guided_coefficients, box means
-                                      of the coefficients, guided_blend; chroma at half size with downsample_2x2(alpha)
+                                      of the coefficients, guided_blend; chroma at half size
   5. detail gate and output
        separable_filter_7, squared_diff, separable_filter_19   local detail energy of the fused Y (sigma 1, sigma 3)
        gather_strided, radix select x 2, quantile_lerp         its 25th percentile (every 97th sample): flat level
@@ -55,9 +72,11 @@ frame t
        pack_10bit                     -> int16 U, V
 ```
 
-The tap counts of the separable filters: 3 (chroma guided-filter box, radius 1), 5 (prefilter), 7 (Gaussian sigma 1,
-luma guided-filter box radius 3, motion pre-blur), 8 (SAD box), 19 (Gaussian sigma 3), 37 (Gaussian sigma 6). Other
-parameters fall back to `separable_filter_any`.
+The tap counts of the separable filters: 3 (chroma guided-filter box, radius 1), 5 (prefilter; the cel preset's
+chroma box, radius 2), 7 (Gaussian sigma 1, luma guided-filter box radius 3, motion pre-blur), 8 (SAD box), 19
+(Gaussian sigma 3, also the stability gate's window), 37 (Gaussian sigma 6). Other tap counts use
+`separable_filter_any`, as the reference uses its generic `sep` kernel for them: in the cel preset the luma box of
+radius 5 (11 taps) and the stability gate's Gaussian sigma 2 (13 taps).
 
 Algorithms with a reference: the motion search follows DIS (Kroeger, Timofte, Dai, Van Gool, *Fast Optical Flow using
 Dense Inverse Search*, ECCV 2016): inverse-compositional patch search on a pyramid, mean-normalised SSD, spatial
@@ -84,8 +103,10 @@ The CUDA output is bit-identical to the Python reference (CuPy). That holds only
    change where FMAs form, and with them the rounding.
 5. **Rounding**: `rintf` and `__float2int_rn` round half to even, as NumPy / CuPy's `rint`. The median is the lower
    middle element (k = (n - 1) / 2), the quantile is NumPy's linear interpolation in its `lerp` form.
-6. **Determinism**: no floating-point atomics anywhere (the only atomics count integers in the radix select), so the
-   output is the same on every run.
+6. **Determinism**: no floating-point atomics anywhere (the only atomics count integers: the radix select's
+   histograms and the range check's sample gather), so the output is the same on every run. The gather appends its
+   samples in a varying order, which the selection does not see: it returns the k-th smallest value, the element
+   `cupy.partition` puts at k.
 7. **Metal** is not bit-exact with CUDA (another compiler, other fast-math functions: `sin(pi x)` instead of `sinpif`;
    the motion search's patch sums use SIMD-group reductions in another order). It is deterministic.
 

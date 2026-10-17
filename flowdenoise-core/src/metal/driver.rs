@@ -92,7 +92,9 @@ pub const OPS_KERNELS: &[&str] = &[
     "copy_words", "copy_bytes", "fill_bytes", "u16_to_float", "abs_diff", "squared_diff", "subtract", "square",
     "absolute", "divide_broadcast", "quantize_8bit", "round_to_integer", "guided_coefficients", "fallback_alpha",
     "guided_blend", "detail_gate_luma", "pack_10bit", "gather_strided", "radix_select_init", "radix_select_histogram",
-    "radix_select_scan", "radix_select_value", "noise_variance", "quantile_lerp",
+    "radix_select_scan", "radix_select_value", "noise_variance", "quantile_lerp", "stability_share",
+    "scale_by_complement", "range_sample_gather", "range_sample_fallback", "range_thresholds", "range_check",
+    "radix_select_init_median", "radix_select_histogram_counted",
 ];
 
 impl Metal {

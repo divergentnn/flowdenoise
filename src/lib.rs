@@ -1,6 +1,7 @@
 //! flowdenoise: a motion-compensated temporal video denoiser on the GPU.
 //!
-//! Each frame is fused with its neighbours t - 3 ..= t + 3 after aligning them with a DIS-style patch motion search
+//! Each frame is fused with its neighbours t - r ..= t + r (r = 3; 8 for cel animation) after aligning them with a
+//! DIS-style patch motion search
 //! and a Lanczos-3 warp. Neighbours are weighted per pixel by MVTools' DegrainWeight on an 8x8 SAD, with a
 //! motion-dependent threshold and spike rejection; where too few frames agree, the result is blended toward a guided
 //! filter, and coherent fine detail of the current frame is put back where the aligned neighbours agree that it is
@@ -27,8 +28,10 @@
 //! Frames are 10-bit 4:2:0 ([`Frame`]); [`Frame`] converts from and to little-endian bytes (raw `yuv420p10le`, y4m
 //! payloads), strided planes, 8-bit planes and, with the `v_frame` feature, `v_frame::frame::Frame<u16>`.
 //!
-//! The two presets ([`Preset`]): `production` (the encode pipeline's denoiser) and `measure` (GRAIL's
-//! pinned measurement settings: the same without the detail boost).
+//! The presets ([`Preset`]): `production` (the encode pipeline's denoiser), `measure` (GRAIL's pinned measurement
+//! settings: the same without the detail boost) and `cel` (2D cel animation: radius 8, the guided fallback everywhere,
+//! gated by stability). The range check ([`Params::range_k`], off in every preset) keeps faint drawn strokes, rain and
+//! sprites that a 1-pixel misalignment of a neighbour would average away.
 use anyhow::{bail, ensure, Result};
 
 pub use flowdenoise_core::{compiled_backends, Backend, Denoise, Params, Preset};

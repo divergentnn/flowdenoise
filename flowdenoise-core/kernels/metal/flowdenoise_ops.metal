@@ -208,6 +208,107 @@ kernel void guided_blend(constant GuidedBlendArgs& args [[buffer(0)]], KERNEL_IN
     args.out[i] = v + args.alpha[i % (uint)args.alpha_period] * (args.mean_a[i] * v + args.mean_b[i] - v);
 }
 
+// ------------------------------------------------------------------------------------------------ stability gate
+
+// stable-texture share s = clamp((energy / max(noise_var fb_q weight_sq_sum / weight_sum^2, 1e-6) - 1) / gate_span)
+// (flowdenoise_ops.cu, stability_share)
+struct StabilityShareArgs {
+    in_plane energy;
+    in_plane noise_var;
+    float fb_q;
+    in_plane weight_sq_sum;
+    in_plane weight_sum;
+    float gate_span;
+    out_plane share;
+    long count;
+};
+kernel void stability_share(constant StabilityShareArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    float scaled_var = *args.noise_var * args.fb_q;
+    float w_sum = args.weight_sum[i];
+    float expected = fmax(scaled_var * args.weight_sq_sum[i] / (w_sum * w_sum), 1e-6f);
+    float ratio = args.energy[i] / expected;
+    args.share[i] = saturate_unit((ratio - 1) / args.gate_span);
+}
+// out = a (1 - s), in place allowed
+struct ScaleByComplementArgs {
+    in_plane a;
+    in_plane s;
+    out_plane out;
+    long count;
+};
+kernel void scale_by_complement(constant ScaleByComplementArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    args.out[i] = args.a[i] * (1 - args.s[i]);
+}
+
+// ------------------------------------------------------------------------------------------------ range check
+// (flowdenoise_ops.cu has the description)
+
+// samples[(*sample_count)++] = abs_diff[j * stride] where the current luma there is in (100, 900), j < m
+struct RangeSampleGatherArgs {
+    in_plane abs_diff;
+    in_plane luma;
+    out_plane samples;
+    device atomic_uint* sample_count;
+    long stride;
+    long m;
+};
+kernel void range_sample_gather(constant RangeSampleGatherArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.m;
+    ELEMENT_INDEX
+    uint p = i * (uint)args.stride;
+    float v = args.luma[p];
+    if (v > 100.f && v < 900.f) {
+        args.samples[atomic_fetch_add_explicit(args.sample_count, 1u, memory_order_relaxed)] = args.abs_diff[p];
+    }
+}
+// fewer than `minimum` mid-luma samples: all of them, samples[j] = abs_diff[j * stride]
+struct RangeSampleFallbackArgs {
+    in_plane abs_diff;
+    out_plane samples;
+    device const uint* sample_count;
+    uint minimum;
+    long stride;
+    long m;
+};
+kernel void range_sample_fallback(constant RangeSampleFallbackArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.m;
+    ELEMENT_INDEX
+    if (*args.sample_count < args.minimum) {
+        args.samples[i] = args.abs_diff[i * (uint)args.stride];
+    }
+}
+// sigma_d = max(1.4826 median, 0.5); thresholds = (sigma_d k, sigma_d k_soft)
+struct RangeThresholdsArgs {
+    in_plane median;
+    float k, k_soft;
+    out_plane thresholds;
+};
+kernel void range_thresholds(constant RangeThresholdsArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    if (threadIdx.x == 0) {
+        float sigma = fmax(1.4826f * *args.median, .5f);
+        args.thresholds[0] = sigma * args.k;
+        args.thresholds[1] = sigma * args.k_soft;
+    }
+}
+// weight *= clamp((t1 - abs_diff) / max(t1 - t0, 1e-6), 0, 1)
+struct RangeCheckArgs {
+    in_plane abs_diff;
+    in_plane thresholds;
+    out_plane weight;
+    long count;
+};
+kernel void range_check(constant RangeCheckArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    long count = args.count;
+    ELEMENT_INDEX
+    float t0 = args.thresholds[0];
+    float t1 = args.thresholds[1];
+    args.weight[i] *= saturate_unit((t1 - args.abs_diff[i]) / fmax(t1 - t0, 1e-6f));
+}
+
 // ------------------------------------------------------------------------------------------------ detail gate, output
 
 // detail gate and output luma (flowdenoise_ops.cu, detail_gate_luma)
@@ -260,7 +361,8 @@ kernel void pack_10bit(constant Pack10BitArgs& args [[buffer(0)]], KERNEL_INDICE
 }
 
 // ------------------------------------------------------------------------------------------------ order statistics
-// 4-pass radix select on order-preserving keys (flowdenoise_ops.cu). state[0] = key prefix, state[1] = rank left.
+// 4-pass radix select on order-preserving keys (flowdenoise_ops.cu). state[0] = key prefix, state[1] = rank left,
+// state[2] = n (the device-counted median only).
 
 static inline uint float_to_ordered_key(float f) {
     uint u = as_type<uint>(f);
@@ -364,6 +466,59 @@ struct RadixSelectValueArgs {
 kernel void radix_select_value(constant RadixSelectValueArgs& args [[buffer(0)]], KERNEL_INDICES) {
     if (threadIdx.x == 0) {
         *args.out = ordered_key_to_float(args.state[0]);
+    }
+}
+// the median of a device-counted set: n = *sample_count if >= minimum, else fallback_n; state = (0, (n - 1) / 2, n)
+struct RadixSelectInitMedianArgs {
+    device uint* state;
+    device uint* histogram;
+    device const uint* sample_count;
+    uint minimum, fallback_n;
+};
+kernel void radix_select_init_median(constant RadixSelectInitMedianArgs& args [[buffer(0)]], KERNEL_INDICES) {
+    uint t = threadIdx.x;
+    if (t == 0) {
+        uint c = *args.sample_count;
+        uint n = c >= args.minimum ? c : args.fallback_n;
+        args.state[0] = 0;
+        args.state[1] = (n - 1) / 2;
+        args.state[2] = n;
+    }
+    for (uint b = t; b < 256; b += blockDim.x) {
+        args.histogram[b] = 0;
+    }
+}
+// radix_select_histogram over the first min(state[2], capacity) values
+struct RadixSelectHistogramCountedArgs {
+    in_plane values;
+    long capacity;
+    device const uint* state;
+    device atomic_uint* histogram;
+    int shift;
+};
+kernel void radix_select_histogram_counted(constant RadixSelectHistogramCountedArgs& args [[buffer(0)]],
+                                           KERNEL_INDICES) {
+    threadgroup atomic_uint block_hist[256];
+    for (uint b = threadIdx.x; b < 256; b += blockDim.x) {
+        atomic_store_explicit(&block_hist[b], 0u, memory_order_relaxed);
+    }
+    SYNC_THREADGROUP();
+    const int shift = args.shift;
+    uint prefix = args.state[0];
+    long n = (long)args.state[2] < args.capacity ? (long)args.state[2] : args.capacity;
+    uint prefix_mask = shift >= 24 ? 0u : (0xffffffffu << (shift + 8));
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x) {
+        uint key = float_to_ordered_key(args.values[i]);
+        if ((key & prefix_mask) == (prefix & prefix_mask)) {
+            atomic_fetch_add_explicit(&block_hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+        }
+    }
+    SYNC_THREADGROUP();
+    for (uint b = threadIdx.x; b < 256; b += blockDim.x) {
+        uint c = atomic_load_explicit(&block_hist[b], memory_order_relaxed);
+        if (c) {
+            atomic_fetch_add_explicit(&args.histogram[b], c, memory_order_relaxed);
+        }
     }
 }
 // noise variance from the median absolute high-pass value: max((1.4826 median)^2, 0.001) * scale

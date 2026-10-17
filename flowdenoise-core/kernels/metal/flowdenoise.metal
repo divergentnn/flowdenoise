@@ -213,11 +213,13 @@ static inline float patch_sum(float a, float b) {
 // (flowdenoise.cu has the algorithm). Metal differences:
 // - one SIMD group of 32 threads per patch row; lane t holds the patch pixels (t % 8, t / 8) and (t % 8, t / 8 + 4)
 //   (suffixes 0 and 1 below), so every patch sum is patch_sum(pixel 0 term, pixel 1 term);
-// - the neighbours' levels come as up to 6 pointers (neighbours[d]) instead of one stacked copy.
+// - the neighbours' levels come as up to 16 pointers (neighbours[d], radius 8) instead of one stacked copy.
 // Grid (patches_y, neighbours), 32 threads per threadgroup.
+// at most 2 x 8 neighbours (radius 8); the host passes this many pointers (unused ones 0)
+#define MAX_NEIGHBOURS 16
 struct MotionSearchArgs {
     in_plane current;
-    in_plane neighbours[6];
+    in_plane neighbours[MAX_NEIGHBOURS];
     int width, height;
     in_plane coarse_flow;
     int coarse_w, coarse_h;
@@ -364,7 +366,7 @@ kernel void motion_search_sweep(constant MotionSearchArgs& args [[buffer(0)]], K
 // levels come as pointers.
 struct DensifyArgs {
     in_plane current;
-    in_plane neighbours[6];
+    in_plane neighbours[MAX_NEIGHBOURS];
     in_plane vectors;
     out_plane flow;
     int width, height, patches_x, patches_y;

@@ -1,5 +1,6 @@
 // flowdenoise_ops.cu: elementwise and order-statistic kernels of the denoiser (format conversions, the guided
-// fallback, the detail gate, output packing, a radix select for medians and quantiles).
+// fallback and its stability gate, the range check, the detail gate, output packing, a radix select for medians and
+// quantiles).
 //
 // Compiled WITHOUT fast math: these are the Python reference's CuPy elementwise operations, which CuPy compiles
 // without it (IEEE division and square root). Do not move them into flowdenoise.cu. As there, every operation and
@@ -117,6 +118,83 @@ extern "C" __global__ void guided_blend(const float* x, const float* alpha, cons
     out[i] = v + alpha[i % alpha_period] * (mean_a[i] * v + mean_b[i] - v);
 }
 
+// stability_share: the stability gate on the guided fallback (fb_gate > 0, preset cel): the share s of stable texture
+// at each pixel, where the fused frame keeps structure well above what the averaged grain would leave.
+//
+// Inputs:  energy, the Gaussian (sigma fb_win) of the squared high-pass x - G(x, fb_sg) of the fused luma x;
+//          noise_var, one float in device memory: the luma noise variance (noise_variance with scale 1);
+//          fb_q; weight_sq_sum, weight_sum (fuse_frames); gate_span = max(fb_gate - 1, 0.001).
+//   expected = max(noise_var * fb_q * weight_sq_sum / weight_sum^2, 1e-6): the grain energy left after averaging
+//              (weight_sq_sum / weight_sum^2 = 1 / effective frame count);
+//   s        = clamp((energy / expected - 1) / gate_span, 0, 1).
+// Output:  share (s), luma plane. The operations are the reference's CuPy steps, one rounding each, in its order.
+extern "C" __global__ void stability_share(const float* energy, const float* noise_var, float fb_q,
+                                           const float* weight_sq_sum, const float* weight_sum, float gate_span,
+                                           float* share, int64_t count) {
+    ELEMENT_INDEX
+    float scaled_var = *noise_var * fb_q;
+    float w_sum = weight_sum[i];
+    float expected = fmaxf(scaled_var * weight_sq_sum[i] / (w_sum * w_sum), 1e-6f);
+    float ratio = energy[i] / expected;
+    share[i] = saturate((ratio - 1) / gate_span);
+}
+
+// scale_by_complement: out = a * (1 - s) (the fallback blend factor gated by the stable share s; in place allowed).
+extern "C" __global__ void scale_by_complement(const float* a, const float* s, float* out, int64_t count) {
+    ELEMENT_INDEX
+    out[i] = a[i] * (1 - s[i]);
+}
+
+// ------------------------------------------------------------------------------------------------ range check
+// --range-k: a motion-compensated neighbour pixel keeps its weight while |warped - current| <= k sigma_d and loses
+// it linearly up to (k + soft) sigma_d. sigma_d is fixed (sqrt(2) x the source noise) or estimated per frame and
+// neighbour from the median |warped - current| over every 53rd pixel of mid luma (range_sample_gather,
+// range_sample_fallback, radix_select_init_median + radix_select_histogram_counted + radix_select_scan /
+// radix_select_value, range_thresholds), all on the device.
+
+// range_sample_gather: the samples abs_diff[j * stride] (j < m) whose current-frame luma lies in (100, 900), appended
+// in any order at samples[*sample_count++] (sample_count zeroed before). The order does not matter: only their k-th
+// smallest value is used.
+extern "C" __global__ void range_sample_gather(const float* abs_diff, const float* luma, float* samples,
+                                               uint32_t* sample_count, int64_t stride, int64_t m) {
+    int64_t count = m;
+    ELEMENT_INDEX
+    float v = luma[i * stride];
+    if (v > 100.f && v < 900.f) {
+        samples[atomicAdd(sample_count, 1u)] = abs_diff[i * stride];
+    }
+}
+
+// range_sample_fallback: with fewer than `minimum` mid-luma samples, all of them: samples[j] = abs_diff[j * stride]
+// for j < m (the selection then takes n = m, radix_select_init_median).
+extern "C" __global__ void range_sample_fallback(const float* abs_diff, float* samples, const uint32_t* sample_count,
+                                                 uint32_t minimum, int64_t stride, int64_t m) {
+    int64_t count = m;
+    ELEMENT_INDEX
+    if (*sample_count < minimum) {
+        samples[i] = abs_diff[i * stride];
+    }
+}
+
+// range_thresholds: sigma_d = max(1.4826 x the median, 0.5) and the two thresholds of the range check,
+// thresholds[0] = sigma_d * k, thresholds[1] = sigma_d * k_soft (k_soft = k + soft, rounded once). One thread.
+extern "C" __global__ void range_thresholds(const float* median, float k, float k_soft, float* thresholds) {
+    if (threadIdx.x == 0) {
+        float sigma = fmaxf(1.4826f * *median, .5f);
+        thresholds[0] = sigma * k;
+        thresholds[1] = sigma * k_soft;
+    }
+}
+
+// range_check: weight *= clamp((t1 - |warped - current|) / max(t1 - t0, 1e-6), 0, 1), t0 = thresholds[0], t1 =
+// thresholds[1] (device memory: range_thresholds, or the fixed sigma's, uploaded once).
+extern "C" __global__ void range_check(const float* abs_diff, const float* thresholds, float* weight, int64_t count) {
+    ELEMENT_INDEX
+    float t0 = thresholds[0];
+    float t1 = thresholds[1];
+    weight[i] *= saturate((t1 - abs_diff[i]) / fmaxf(t1 - t0, 1e-6f));
+}
+
 // ------------------------------------------------------------------------------------------------ detail gate, output
 
 // detail_gate_luma: puts the current frame's own fine detail back where it is coherent texture, and writes the
@@ -169,7 +247,8 @@ extern "C" __global__ void pack_10bit(const float* src, int16_t* dst, int64_t co
 // ------------------------------------------------------------------------------------------------ order statistics
 // The k-th smallest of n floats with a 4-pass radix select (8 bits per pass, most significant first) on order-
 // preserving integer keys. The state stays on the device: no host round trip between the passes.
-//   state[0] = the key prefix found so far, state[1] = the rank still to find among the keys with that prefix;
+//   state[0] = the key prefix found so far, state[1] = the rank still to find among the keys with that prefix,
+//   state[2] = the number of values (the device-counted selection only, radix_select_init_median);
 //   histogram = 256 counters (zeroed by radix_select_init and after each scan).
 
 // Order-preserving map of float bits to uint32: negative floats reversed below the positive ones.
@@ -259,6 +338,50 @@ extern "C" __global__ void radix_select_scan(uint32_t* state, uint32_t* histogra
 extern "C" __global__ void radix_select_value(const uint32_t* state, float* out) {
     if (threadIdx.x == 0) {
         *out = ordered_key_to_float(state[0]);
+    }
+}
+
+// radix_select_init_median: as radix_select_init, for the median (lower middle element) of n values where n lives
+// on the device: n = *sample_count if it is at least `minimum`, else fallback_n (range_sample_fallback filled that
+// many); state = (0, (n - 1) / 2, n). One block.
+extern "C" __global__ void radix_select_init_median(uint32_t* state, uint32_t* histogram, const uint32_t* sample_count,
+                                                    uint32_t minimum, uint32_t fallback_n) {
+    int t = threadIdx.x;
+    if (t == 0) {
+        uint32_t c = *sample_count;
+        uint32_t n = c >= minimum ? c : fallback_n;
+        state[0] = 0;
+        state[1] = (n - 1) / 2;
+        state[2] = n;
+    }
+    for (int b = t; b < 256; b += blockDim.x) {
+        histogram[b] = 0;
+    }
+}
+
+// radix_select_histogram_counted: radix_select_histogram over the first state[2] values (at most `capacity`, the
+// size the grid was launched for).
+extern "C" __global__ void radix_select_histogram_counted(const float* values, int64_t capacity, const uint32_t* state,
+                                                          uint32_t* histogram, int shift) {
+    __shared__ uint32_t block_hist[256];
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) {
+        block_hist[b] = 0;
+    }
+    __syncthreads();
+    uint32_t prefix = state[0];
+    int64_t n = min((int64_t)state[2], capacity);
+    uint32_t prefix_mask = shift >= 24 ? 0u : (0xffffffffu << (shift + 8));
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        uint32_t key = float_to_ordered_key(values[i]);
+        if ((key & prefix_mask) == (prefix & prefix_mask)) {
+            atomicAdd(&block_hist[(key >> shift) & 255u], 1u);
+        }
+    }
+    __syncthreads();
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) {
+        if (block_hist[b]) {
+            atomicAdd(&histogram[b], block_hist[b]);
+        }
     }
 }
 

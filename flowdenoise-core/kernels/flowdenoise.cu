@@ -150,7 +150,8 @@ SEPARABLE_FILTER(19)
 SEPARABLE_FILTER(37)
 
 // separable_filter_any: one pass of a separable FIR filter with any number of taps (the tiled kernels above cover
-// the tap counts of the presets; this one serves other parameters, e.g. a guided-filter radius of 4).
+// the tap counts of the production and measure presets; this one serves the others, e.g. the cel preset's 11-tap
+// guided-filter box and 13-tap Gaussian sigma 2, as the reference's generic `sep` kernel does).
 //
 // Computes dst(x, y) = sum_j taps[j] * src(x + j - tap_count / 2, y) along `axis` (AXIS_X or AXIS_Y), the taps
 // summed in order j = 0 ... tap_count - 1.

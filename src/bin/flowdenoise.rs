@@ -17,7 +17,8 @@ struct Cli {
     input: PathBuf,
     /// output y4m, or - for stdout
     output: PathBuf,
-    /// parameter set: production (the encode pipeline's) or measure (GRAIL's; no detail boost)
+    /// parameter set: production (the encode pipeline's), measure (GRAIL's; no detail boost) or cel (2D cel
+    /// animation: radius 8, gated guided fallback)
     #[arg(short, long, default_value = "production", env = "FLOWDENOISE_PRESET")]
     preset: Preset,
     /// GPU backend: auto, cuda, hip or metal
@@ -75,6 +76,30 @@ struct Cli {
     /// guided filter radius (luma; chroma half)
     #[arg(long, help_heading = "Parameters (default: the preset's)")]
     fallback_radius: Option<usize>,
+    /// stability gate on the guided fallback: skipped where the fused frame keeps structure G times above the
+    /// averaged grain's energy (0 = off; cel: 3)
+    #[arg(long, value_name = "G", help_heading = "Parameters (default: the preset's)")]
+    fb_gate: Option<f64>,
+    /// stability gate: scale of the expected residual grain energy
+    #[arg(long, help_heading = "Parameters (default: the preset's)")]
+    fb_q: Option<f64>,
+    /// stability gate: high-pass sigma
+    #[arg(long, help_heading = "Parameters (default: the preset's)")]
+    fb_sg: Option<f64>,
+    /// stability gate: energy window sigma
+    #[arg(long, help_heading = "Parameters (default: the preset's)")]
+    fb_win: Option<f64>,
+    /// range check: a neighbour pixel keeps its weight while |warped - current| <= K sigma_d and loses it linearly up
+    /// to (K + range-soft) sigma_d; keeps faint strokes, rain and sprites (0 = off, the default of every preset)
+    #[arg(long, value_name = "K", help_heading = "Parameters (default: the preset's)")]
+    range_k: Option<f64>,
+    /// range check: width of the falloff, in sigma_d
+    #[arg(long, help_heading = "Parameters (default: the preset's)")]
+    range_soft: Option<f64>,
+    /// range check: the source's pixel noise in 10-bit codes (sigma_d = sqrt(2) S); 0 = per frame and neighbour from
+    /// the median |warped - current| over mid-luma pixels
+    #[arg(long, value_name = "S", help_heading = "Parameters (default: the preset's)")]
+    range_sigma: Option<f64>,
 }
 
 impl Cli {
@@ -84,7 +109,7 @@ impl Cli {
             ($($f:ident),*) => { $(if let Some(v) = self.$f { p.$f = v; })* };
         }
         set!(radius, thsad, flow_scale, levels, finest, iterations, detail_gate, detail_boost, spike, fast_th, fallback,
-             fallback_eps, fallback_radius);
+             fallback_eps, fallback_radius, fb_gate, fb_q, fb_sg, fb_win, range_k, range_soft, range_sigma);
         if self.no_round_motion {
             p.round_motion = false;
         }

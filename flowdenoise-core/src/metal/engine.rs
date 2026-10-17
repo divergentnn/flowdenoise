@@ -3,7 +3,7 @@
 //! search takes the neighbours' pyramid levels by pointer (no stacked copy) and runs one SIMD group per patch row.
 use super::buf::{launch, launch_n, DBuf};
 use super::ops::Select;
-use crate::{args, Denoise, Params};
+use crate::{args, Arg, Denoise, Params};
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
 
@@ -24,6 +24,9 @@ impl Ingested {
     }
 }
 
+/// neighbour pointers the motion kernels take (flowdenoise.metal MAX_NEIGHBOURS): radius 8
+const MAX_NEIGHBOURS: usize = 16;
+
 struct Taps {
     k: DBuf,
     len: usize,
@@ -39,6 +42,13 @@ pub struct Engine {
     sel: Select,
 }
 
+/// the range check's thresholds (t0, t1) for a fixed sigma: flowdegrain2 range_sigma() with --range-sigma S > 0,
+/// sigma_d = float32(sqrt(2) S), then sigma_d * float32(k) and sigma_d * float32(k + soft) in float32
+fn range_fixed_thresholds(p: &Params) -> [f32; 2] {
+    let sd = (2f64.sqrt() * p.range_sigma) as f32;
+    [sd * p.range_k as f32, sd * (p.range_k + p.range_soft) as f32]
+}
+
 fn gauss_taps(sigma: f64) -> Vec<f32> {
     // flowdegrain2 Engine.gauss: t = arange(-int(3 sigma), int(3 sigma) + 1); exp(-t t / (2 sigma sigma)); normalized
     let r = (3.0 * sigma) as i64;
@@ -52,7 +62,6 @@ impl Engine {
     pub fn new(w: usize, h: usize, p: Params) -> Result<Engine> {
         p.validate()?;
         p.check_size(w, h)?;
-        anyhow::ensure!(p.radius <= 3, "the Metal backend takes a radius of at most 3 (6 neighbours)");
         let sc = p.motion_scale(w);
         let mut taps = HashMap::new();
         let mut add = |name: &'static str, k: Vec<f32>| -> Result<()> {
@@ -70,7 +79,15 @@ impl Engine {
         add("box_y", vec![(1.0 / (2 * r + 1) as f64) as f32; 2 * r + 1])?;
         let rc = (r / 2).max(1);
         add("box_c", vec![(1.0 / (2 * rc + 1) as f64) as f32; 2 * rc + 1])?;
-        Ok(Engine { w, h, sc, p, taps, pool: HashMap::new(), sel: Select::new()? })
+        if p.fb_gate > 0.0 {
+            add("g_fb_sg", gauss_taps(p.fb_sg))?;
+            add("g_fb_win", gauss_taps(p.fb_win))?;
+        }
+        let mut pool = HashMap::new();
+        if p.range_k > 0.0 && p.range_sigma > 0.0 {
+            pool.insert("range_fixed", DBuf::upload(&range_fixed_thresholds(&p))?);
+        }
+        Ok(Engine { w, h, sc, p, taps, pool, sel: Select::new()? })
     }
 
     /// scratch buffer `name` of at least `bytes` (reused across frames)
@@ -153,9 +170,9 @@ impl Engine {
         for level in (self.p.finest..self.p.levels).rev() {
             let (cbuf, w, h) = (&cur.levels[level].0, cur.levels[level].1, cur.levels[level].2);
             let c = cbuf.ptr;
-            // the neighbours' levels by pointer (the CUDA version copies them into one stack)
-            assert!(d <= 6, "at most 6 neighbours");
-            let ns: Vec<u64> = (0..6).map(|j| nbrs.get(j).map(|nb| nb.levels[level].0.ptr).unwrap_or(0)).collect();
+            // the neighbours' levels by pointer (the CUDA version copies them into one stack): MAX_NEIGHBOURS of them
+            assert!(d <= MAX_NEIGHBOURS, "at most {MAX_NEIGHBOURS} neighbours");
+            let ns: Vec<Arg> = (0..MAX_NEIGHBOURS).map(|j| Arg::P(nbrs.get(j).map(|nb| nb.levels[level].0.ptr).unwrap_or(0))).collect();
             let bw = 1.max(1 + (w as i64 - 8).div_euclid(4)) as usize;
             let bh = 1.max(1 + (h as i64 - 8).div_euclid(4)) as usize;
             let fwd = self.buf("r_fwd", d * 2 * bw * bh * 4)?;
@@ -163,27 +180,26 @@ impl Engine {
             let (pp, pw, ph) = pred.unwrap_or((0, 0, 0));
             let it = self.p.iterations / 2;
             let grid = (bh as u32, d as u32, 1);
-            let n6 = [ns[0], ns[1], ns[2], ns[3], ns[4], ns[5]];
             // one SIMD group (32 lanes, two pixels each) per patch row
+            let with_nbrs = |tail: &[Arg]| -> Vec<Arg> { [&[Arg::P(c)][..], &ns[..], tail].concat() };
             launch("motion_search_sweep", grid, (32, 1, 1), 0,
-                   args![c, n6[0], n6[1], n6[2], n6[3], n6[4], n6[5], w as i32, h as i32, pp, pw as i32, ph as i32, 0u64, fwd,
-                         bw as i32, bh as i32, 0i32, it])?;
+                   &with_nbrs(args![w as i32, h as i32, pp, pw as i32, ph as i32, 0u64, fwd, bw as i32, bh as i32, 0i32, it]))?;
             launch("motion_search_sweep", grid, (32, 1, 1), 0,
-                   args![c, n6[0], n6[1], n6[2], n6[3], n6[4], n6[5], w as i32, h as i32, pp, pw as i32, ph as i32, fwd, back,
-                         bw as i32, bh as i32, 1i32, it])?;
+                   &with_nbrs(args![w as i32, h as i32, pp, pw as i32, ph as i32, fwd, back, bw as i32, bh as i32, 1i32, it]))?;
             // ping-pong between two dense buffers: the next level reads `pred` while writing the other
             let name = if flip { "r_pred_a" } else { "r_pred_b" };
             flip = !flip;
             let np = self.buf(name, d * 2 * w * h * 4)?;
             launch("densify_flow", ((w * h).div_ceil(256) as u32, d as u32, 1), (256, 1, 1), 0,
-                   args![c, n6[0], n6[1], n6[2], n6[3], n6[4], n6[5], back, np, w as i32, h as i32, bw as i32, bh as i32])?;
+                   &with_nbrs(args![back, np, w as i32, h as i32, bw as i32, bh as i32]))?;
             pred = Some((np, w, h));
         }
         Ok(pred.unwrap())
     }
 
-    /// flowdegrain2 noise(): per plane, max((1.4826 median |hp[::53]|)^2, 0.001) * mult -> var[plane] (device)
-    fn noise(&mut self, hp: u64, plane: usize, planes: usize, var: u64, mult: f32) -> Result<()> {
+    /// flowdegrain2 noise(): per plane, max((1.4826 median |hp[::53]|)^2, 0.001) * mult -> var[plane] (device);
+    /// returns the device float that holds the last plane's median (valid until the next call)
+    fn noise(&mut self, hp: u64, plane: usize, planes: usize, var: u64, mult: f32) -> Result<u64> {
         let m = plane.div_ceil(53);
         let g = self.buf("noise_g", m * planes * 4)?;
         launch_n("gather_strided", m * planes, args![hp, g, plane as i64, 53i64, m as i64, planes as i32, 1i32])?;
@@ -192,7 +208,43 @@ impl Engine {
             self.sel.kth(g + (p * m * 4) as u64, m, ((m - 1) / 2) as u32, med)?;
             launch("noise_variance", (1, 1, 1), (32, 1, 1), 0, args![med, var + (p * 4) as u64, mult])?;
         }
-        Ok(())
+        Ok(med)
+    }
+
+    /// flowdegrain2 stability(): the stable-texture share s of the fused luma x -> share (luma plane):
+    /// hp = x - G(x, fb_sg); e = G(hp^2, fb_win); s = clamp((e / max(nv fb_q sq / ws^2, 1e-6) - 1) / (fb_gate - 1))
+    fn stability(&mut self, x: u64, nv: u64, sq: u64, ws: u64, share: u64) -> Result<()> {
+        let (w, h) = (self.w, self.h);
+        let n = w * h;
+        let g = self.buf("st_g", n * 4)?;
+        self.filt(x, g, w, h, 1, "g_fb_sg", false, false)?;
+        let hp = self.buf("st_hp", n * 4)?;
+        launch_n("subtract", n, args![x, g, hp, n as i64])?;
+        let hp2 = self.buf("st_hp2", n * 4)?;
+        launch_n("square", n, args![hp, hp2, n as i64])?;
+        let e = self.buf("st_e", n * 4)?;
+        self.filt(hp2, e, w, h, 1, "g_fb_win", false, false)?;
+        let span = (self.p.fb_gate - 1.0).max(1e-3) as f32;
+        launch_n("stability_share", n, args![e, nv, self.p.fb_q as f32, sq, ws, span, share, n as i64])
+    }
+
+    /// flowdegrain2 range_sigma() without --range-sigma, on the device: sigma_d from the median of dd[::53] over
+    /// mid-luma pixels of the current frame y (all of dd[::53] if fewer than 1000), and the thresholds
+    /// (sigma_d k, sigma_d (k + soft)) -> the returned device buffer (two floats)
+    fn range_thresholds(&mut self, dd: u64, y: u64) -> Result<u64> {
+        let n = self.w * self.h;
+        let m = n.div_ceil(53);
+        let samples = self.buf("rg_samples", m * 4)?;
+        let count = self.buf("rg_count", 4)?;
+        super::driver::gpu().memset(count, 0, 4)?;
+        launch_n("range_sample_gather", m, args![dd, y, samples, count, 53i64, m as i64])?;
+        launch_n("range_sample_fallback", m, args![dd, samples, count, 1000u32, 53i64, m as i64])?;
+        let med = self.buf("rg_median", 4)?;
+        self.sel.median_counted(samples, m, count, 1000, m as u32, med)?;
+        let t = self.buf("rg_thresholds", 8)?;
+        let (k, k_soft) = (self.p.range_k as f32, (self.p.range_k + self.p.range_soft) as f32);
+        launch("range_thresholds", (1, 1, 1), (32, 1, 1), 0, args![med, k, k_soft, t])?;
+        Ok(t)
     }
 
     /// flowdegrain2 fallback(): guided filter blend of x (planes x n) with alpha (broadcast modulo am)
@@ -271,6 +323,13 @@ impl Engine {
                 let hp = high + (j * n * 4) as u64;
                 launch_n("temporal_weight", n, args![yw, low, sad, dd, spread, speed, wt, hp, w as i32, h as i32,
                                                  p.thsad, dist.abs() as f32, p.fast_th, p.spike])?;
+                if p.range_k > 0.0 {
+                    let t = match self.pool.get("range_fixed") {
+                        Some(b) => b.ptr,
+                        None => self.range_thresholds(dd, y)?,
+                    };
+                    launch_n("range_check", n, args![dd, t, wt, n as i64])?;
+                }
                 launch_n("warp_accumulate_chroma", nc, args![other.c(), f, wt, ac, wc, w2 as i32, h2 as i32, fw as i32, fh as i32, scale])?;
             }
         }
@@ -283,7 +342,21 @@ impl Engine {
             let alpha = self.buf("alpha", n * 4)?;
             launch_n("fallback_alpha", n, args![ws, sq, p.fallback, alpha, n as i64])?;
             let var_y = self.buf("var_y", 4)?;
-            self.noise(hc, n, 1, var_y, p.fallback_eps)?;
+            let med_y = self.noise(hc, n, 1, var_y, p.fallback_eps)?;
+            let alpha_c = self.buf("alpha_c", nc * 4)?;
+            self.down(alpha, alpha_c, w, h)?;
+            if p.fb_gate > 0.0 {
+                // stability gate (preset cel): alpha *= 1 - s; the chroma factor is down(alpha) (taken before the
+                // gate) times 1 - down(s)
+                let nv = self.buf("fb_nv", 4)?;
+                launch("noise_variance", (1, 1, 1), (32, 1, 1), 0, args![med_y, nv, 1.0f32])?;
+                let s = self.buf("fb_s", n * 4)?;
+                self.stability(oy, nv, sq, ws, s)?;
+                launch_n("scale_by_complement", n, args![alpha, s, alpha, n as i64])?;
+                let s_c = self.buf("fb_s_c", nc * 4)?;
+                self.down(s, s_c, w, h)?;
+                launch_n("scale_by_complement", nc, args![alpha_c, s_c, alpha_c, nc as i64])?;
+            }
             let oy2 = self.buf("oy2", n * 4)?;
             self.fallback(oy, oy2, alpha, n, var_y, w, h, 1, "box_y", &["fy_m", "fy_x2", "fy_m2", "fy_ga", "fy_gb", "fy_t"])?;
             // chroma: hp = c - gauss(c, 1) per plane
@@ -293,8 +366,6 @@ impl Engine {
             launch_n("subtract", 2 * nc, args![cur.c(), gc, hpc, (2 * nc) as i64])?;
             let var_c = self.buf("var_c", 8)?;
             self.noise(hpc, nc, 2, var_c, p.fallback_eps)?;
-            let alpha_c = self.buf("alpha_c", nc * 4)?;
-            self.down(alpha, alpha_c, w, h)?;
             let oc2 = self.buf("oc2", 2 * nc * 4)?;
             self.fallback(oc, oc2, alpha_c, nc, var_c, w2, h2, 2, "box_c", &["fc_m", "fc_x2", "fc_m2", "fc_ga", "fc_gb", "fc_t"])?;
             (oy2, oc2)

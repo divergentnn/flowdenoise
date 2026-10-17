@@ -13,12 +13,23 @@ pub struct Select {
 }
 impl Select {
     pub fn new() -> Result<Select> {
-        Ok(Select { st: DBuf::zeroed(8)?, hist: DBuf::zeroed(256 * 4)? })
+        Ok(Select { st: DBuf::zeroed(16)?, hist: DBuf::zeroed(256 * 4)? })
     }
     pub fn kth(&mut self, v: u64, n: usize, k: u32, out: u64) -> Result<()> {
         launch("radix_select_init", (1, 1, 1), (256, 1, 1), 0, args![&self.st, &self.hist, k])?;
         for shift in [24i32, 16, 8, 0] {
             launch_reduce("radix_select_histogram", n, args![v, n as i64, &self.st, &self.hist, shift])?;
+            launch("radix_select_scan", (1, 1, 1), (32, 1, 1), 0, args![&self.st, &self.hist, shift])?;
+        }
+        launch("radix_select_value", (1, 1, 1), (32, 1, 1), 0, args![&self.st, out])
+    }
+    /// the median (lower middle element, k = (n - 1) / 2) of n floats at `v`, n counted on the device: n = *count
+    /// (u32) if it is at least `minimum`, else `fallback_n`; `capacity` (>= either) sizes the grid -> *out
+    pub fn median_counted(&mut self, v: u64, capacity: usize, count: u64, minimum: u32, fallback_n: u32, out: u64)
+                          -> Result<()> {
+        launch("radix_select_init_median", (1, 1, 1), (256, 1, 1), 0, args![&self.st, &self.hist, count, minimum, fallback_n])?;
+        for shift in [24i32, 16, 8, 0] {
+            launch_reduce("radix_select_histogram_counted", capacity, args![v, capacity as i64, &self.st, &self.hist, shift])?;
             launch("radix_select_scan", (1, 1, 1), (32, 1, 1), 0, args![&self.st, &self.hist, shift])?;
         }
         launch("radix_select_value", (1, 1, 1), (32, 1, 1), 0, args![&self.st, out])
