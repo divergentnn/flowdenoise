@@ -39,7 +39,7 @@ of [GRAILS](https://github.com/divergentnn/grail), a grain-aware video quality m
 | backend | feature | status |
 |---|---|---|
 | NVIDIA GPUs (CUDA 12+, sm_75 and newer; PTX for newer GPUs) | `cuda` (default) | tested (RTX 3090) |
-| Apple GPUs (Metal, macOS) | `metal` (default; inert elsewhere) | tested (M1 Max); tiny numeric differences from CUDA. The `cel` preset (radius 8), its stability gate, the range check and the persistence restore are compile-checked only on Metal: not run yet |
+| Apple GPUs (Metal, macOS) | `metal` (default; inert elsewhere) | tested (M1 Max); tiny numeric differences from CUDA. The `cel` preset (radius 8), its stability gate, the range check and the persistence restore are compile-checked only on Metal: not run yet. The radius change also altered the Metal motion kernels' arguments for every preset, so the whole Metal backend is unverified since 89939c9 (last run on a Mac) |
 | AMD GPUs (HIP / ROCm) | `hip` | the kernels compile with hipcc; not run yet |
 
 There is no CPU backend.
